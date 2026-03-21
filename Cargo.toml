@@ -11,7 +11,7 @@ repository = "https://github.com/jprendes/wsproxy"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.29"
 futures-util = "0.3"
 thiserror = "2"
 

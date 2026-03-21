@@ -138,6 +138,7 @@ async fn handle_ws_connection(stream: TcpStream, inner: Arc<ProxyServerInner>) -
     let path = Arc::new(std::sync::Mutex::new(String::new()));
     let path_clone = Arc::clone(&path);
 
+    #[allow(clippy::result_large_err)] // the err variant is the error response
     let callback = move |req: &Request, response: Response| {
         let uri_path = req.uri().path().to_string();
         *path_clone.lock().unwrap() = uri_path;
@@ -205,7 +206,9 @@ async fn handle_ws_connection(stream: TcpStream, inner: Arc<ProxyServerInner>) -
             if n == 0 {
                 break;
             }
-            ws_write.send(Message::Binary(buf[..n].to_vec())).await?;
+            ws_write
+                .send(Message::Binary(buf[..n].to_vec().into()))
+                .await?;
         }
         Ok::<_, Error>(())
     };

@@ -96,7 +96,9 @@ async fn handle_tcp_connection(tcp_stream: TcpStream, server_url: &str) -> Resul
             if n == 0 {
                 break;
             }
-            ws_write.send(Message::Binary(buf[..n].to_vec())).await?;
+            ws_write
+                .send(Message::Binary(buf[..n].to_vec().into()))
+                .await?;
         }
         Ok::<_, Error>(())
     };
