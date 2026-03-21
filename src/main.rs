@@ -26,6 +26,18 @@ enum Commands {
         /// Default target for paths that don't match any route (e.g., "127.0.0.1:22")
         #[arg(short, long)]
         default_target: Option<String>,
+
+        /// Path to TLS certificate file (PEM format) for WSS support
+        #[arg(long, requires = "tls_key", conflicts_with = "tls_self_signed")]
+        tls_cert: Option<String>,
+
+        /// Path to TLS private key file (PEM format) for WSS support
+        #[arg(long, requires = "tls_cert", conflicts_with = "tls_self_signed")]
+        tls_key: Option<String>,
+
+        /// Generate a self-signed TLS certificate for WSS support
+        #[arg(long, conflicts_with_all = ["tls_cert", "tls_key"])]
+        tls_self_signed: bool,
     },
 
     /// Run the proxy client (TCP -> WebSocket)
@@ -34,9 +46,17 @@ enum Commands {
         #[arg(short, long)]
         listen: String,
 
-        /// WebSocket server URL to connect to (e.g., "ws://server:8080/ssh")
+        /// WebSocket server URL to connect to (e.g., "ws://server:8080/ssh" or "wss://server:8080/ssh")
         #[arg(short, long)]
         server: String,
+
+        /// Skip TLS certificate verification (insecure, for self-signed certificates)
+        #[arg(short = 'k', long)]
+        insecure: bool,
+
+        /// Path to CA certificate file (PEM format) for verifying self-signed server certificates
+        #[arg(long)]
+        tls_ca_cert: Option<String>,
     },
 
     /// Manage daemon processes with automatic restart
@@ -62,6 +82,18 @@ enum DaemonAction {
         /// Default target for paths that don't match any route (e.g., "127.0.0.1:22")
         #[arg(short, long)]
         default_target: Option<String>,
+
+        /// Path to TLS certificate file (PEM format) for WSS support
+        #[arg(long, requires = "tls_key", conflicts_with = "tls_self_signed")]
+        tls_cert: Option<String>,
+
+        /// Path to TLS private key file (PEM format) for WSS support
+        #[arg(long, requires = "tls_cert", conflicts_with = "tls_self_signed")]
+        tls_key: Option<String>,
+
+        /// Generate a self-signed TLS certificate for WSS support
+        #[arg(long, conflicts_with_all = ["tls_cert", "tls_key"])]
+        tls_self_signed: bool,
     },
 
     /// Run the proxy client as a daemon with automatic restart
@@ -70,9 +102,17 @@ enum DaemonAction {
         #[arg(short, long)]
         listen: String,
 
-        /// WebSocket server URL to connect to (e.g., "ws://server:8080/ssh")
+        /// WebSocket server URL to connect to (e.g., "ws://server:8080/ssh" or "wss://server:8080/ssh")
         #[arg(short, long)]
         server: String,
+
+        /// Skip TLS certificate verification (insecure, for self-signed certificates)
+        #[arg(short = 'k', long)]
+        insecure: bool,
+
+        /// Path to CA certificate file (PEM format) for verifying self-signed server certificates
+        #[arg(long)]
+        tls_ca_cert: Option<String>,
     },
 
     /// List all running daemons
@@ -106,11 +146,23 @@ async fn run() -> wsproxy::Result<()> {
             listen,
             route,
             default_target,
+            tls_cert,
+            tls_key,
+            tls_self_signed,
         } => {
+            let tls = match (tls_cert, tls_key, tls_self_signed) {
+                (Some(cert), Some(key), false) => wsproxy::server::TlsMode::Files {
+                    cert: cert.leak(),
+                    key: key.leak(),
+                },
+                (None, None, true) => wsproxy::server::TlsMode::SelfSigned,
+                _ => wsproxy::server::TlsMode::None,
+            };
+
             // Check if we should monitor stdin for parent death (daemon mode)
             if daemon::should_monitor_stdin() {
                 tokio::select! {
-                    result = wsproxy::server::run(&listen, &route, default_target.as_deref()) => {
+                    result = wsproxy::server::run(&listen, &route, default_target.as_deref(), tls) => {
                         result?;
                     }
                     _ = daemon::wait_for_stdin_close() => {
@@ -119,15 +171,25 @@ async fn run() -> wsproxy::Result<()> {
                     }
                 }
             } else {
-                wsproxy::server::run(&listen, &route, default_target.as_deref()).await?;
+                wsproxy::server::run(&listen, &route, default_target.as_deref(), tls).await?;
             }
         }
 
-        Commands::Client { listen, server } => {
+        Commands::Client {
+            listen,
+            server,
+            insecure,
+            tls_ca_cert,
+        } => {
+            let tls_options = wsproxy::client::TlsOptions {
+                insecure,
+                ca_cert_path: tls_ca_cert,
+            };
+
             // Check if we should monitor stdin for parent death (daemon mode)
             if daemon::should_monitor_stdin() {
                 tokio::select! {
-                    result = wsproxy::client::run(&listen, &server) => {
+                    result = wsproxy::client::run(&listen, &server, &tls_options) => {
                         result?;
                     }
                     _ = daemon::wait_for_stdin_close() => {
@@ -136,7 +198,7 @@ async fn run() -> wsproxy::Result<()> {
                     }
                 }
             } else {
-                wsproxy::client::run(&listen, &server).await?;
+                wsproxy::client::run(&listen, &server, &tls_options).await?;
             }
         }
 
@@ -145,12 +207,20 @@ async fn run() -> wsproxy::Result<()> {
                 listen,
                 route,
                 default_target,
+                tls_cert,
+                tls_key,
+                tls_self_signed,
             } => {
-                daemon::spawn_server(listen, route, default_target)?;
+                daemon::spawn_server(listen, route, default_target, tls_cert, tls_key, tls_self_signed)?;
             }
 
-            DaemonAction::Client { listen, server } => {
-                daemon::spawn_client(listen, server)?;
+            DaemonAction::Client {
+                listen,
+                server,
+                insecure,
+                tls_ca_cert,
+            } => {
+                daemon::spawn_client(listen, server, insecure, tls_ca_cert)?;
             }
 
             DaemonAction::List => {

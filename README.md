@@ -36,10 +36,25 @@ wsproxy server --listen 0.0.0.0:8080 \
   --route /redis=127.0.0.1:6379
 ```
 
+**Server with TLS (WSS):**
+
+```bash
+wsproxy server --listen 0.0.0.0:8443 \
+  --default-target 127.0.0.1:22 \
+  --tls-cert cert.pem \
+  --tls-key key.pem
+```
+
 **Client:**
 
 ```bash
 wsproxy client --listen 127.0.0.1:2222 --server ws://proxy-server:8080/ssh
+```
+
+**Client connecting to WSS server:**
+
+```bash
+wsproxy client --listen 127.0.0.1:2222 --server wss://proxy-server:8443/ssh
 ```
 
 ### Daemon Mode
@@ -50,6 +65,13 @@ Run the server or client as a background daemon with automatic restart on failur
 
 ```bash
 wsproxy daemon server --listen 0.0.0.0:8080 --default-target 127.0.0.1:22
+```
+
+**Start a server daemon with TLS:**
+
+```bash
+wsproxy daemon server --listen 0.0.0.0:8443 --default-target 127.0.0.1:22 \
+  --tls-cert cert.pem --tls-key key.pem
 ```
 
 **Start a client daemon:**
@@ -93,10 +115,16 @@ async fn main() -> wsproxy::Result<()> {
         .route("/db", "127.0.0.1:5432")?
         .bind("0.0.0.0:8080")?;
 
-    // Client
+    // Server with TLS (WSS)
+    let secure_server = ProxyServer::builder()
+        .default_target("127.0.0.1:22")?
+        .tls("cert.pem", "key.pem")
+        .bind("0.0.0.0:8443")?;
+
+    // Client (supports both ws:// and wss://)
     let client = ProxyClient::bind(
         "127.0.0.1:2222",
-        "ws://proxy-server:8080/ssh",
+        "wss://proxy-server:8443/ssh",
     )?;
 
     // Run (typically in separate processes)

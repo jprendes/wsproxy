@@ -22,7 +22,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use wsproxy::{ProxyServer, ProxyClient};
+//! use wsproxy::{ProxyServer, ProxyClient, TlsOptions};
 //!
 //! #[tokio::main]
 //! async fn main() -> wsproxy::Result<()> {
@@ -42,6 +42,7 @@
 //!     let client = ProxyClient::bind(
 //!         "127.0.0.1:2222",
 //!         "ws://proxy-server:8080/ssh",
+//!         TlsOptions::default(),
 //!     )?;
 //!
 //!     // Run server or client (typically in separate processes)
@@ -55,6 +56,6 @@ pub mod client;
 mod error;
 pub mod server;
 
-pub use client::ProxyClient;
+pub use client::{ProxyClient, TlsOptions};
 pub use error::{Error, Result};
-pub use server::{ProxyServer, ProxyServerBuilder};
+pub use server::{ProxyServer, ProxyServerBuilder, TlsMode};

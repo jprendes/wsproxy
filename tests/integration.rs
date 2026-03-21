@@ -1,10 +1,11 @@
 //! Integration tests for wsproxy
 
+use std::io::Write;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use wsproxy::{ProxyClient, ProxyServer};
+use wsproxy::{ProxyClient, ProxyServer, TlsOptions};
 
 /// Create a simple TCP echo server that echoes back any data it receives.
 async fn start_echo_server(addr: &str) -> u16 {
@@ -63,6 +64,7 @@ async fn test_roundtrip_tcp_ws_tcp() {
     let proxy_client = ProxyClient::bind(
         format!("127.0.0.1:{}", client_port),
         format!("ws://127.0.0.1:{}", ws_port),
+        TlsOptions::default(),
     )
     .unwrap();
 
@@ -133,6 +135,7 @@ async fn test_multiple_routes() {
     let proxy_client1 = ProxyClient::bind(
         format!("127.0.0.1:{}", client1_port),
         format!("ws://127.0.0.1:{}/echo1", ws_port),
+        TlsOptions::default(),
     )
     .unwrap();
 
@@ -143,6 +146,7 @@ async fn test_multiple_routes() {
     let proxy_client2 = ProxyClient::bind(
         format!("127.0.0.1:{}", client2_port),
         format!("ws://127.0.0.1:{}/echo2", ws_port),
+        TlsOptions::default(),
     )
     .unwrap();
 
@@ -207,6 +211,7 @@ async fn test_large_data_transfer() {
     let proxy_client = ProxyClient::bind(
         format!("127.0.0.1:{}", client_port),
         format!("ws://127.0.0.1:{}", ws_port),
+        TlsOptions::default(),
     )
     .unwrap();
 
@@ -409,4 +414,316 @@ async fn test_bidirectional_chat_daemon() {
     }
 
     // runner dropped here, cleans up daemons automatically
+}
+
+/// Generate a self-signed CA certificate and server certificate for testing.
+/// Returns (ca_cert_pem, server_cert_pem, server_key_pem).
+fn generate_test_certs() -> (String, String, String) {
+    use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose};
+
+    // Generate CA key pair
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+
+    // Generate CA certificate
+    let mut ca_params = CertificateParams::default();
+    ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "Test CA");
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+    // Generate server certificate signed by CA
+    let mut server_params = CertificateParams::default();
+    server_params
+        .distinguished_name
+        .push(DnType::CommonName, "localhost");
+    server_params.subject_alt_names = vec![
+        rcgen::SanType::DnsName("localhost".try_into().unwrap()),
+        rcgen::SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))),
+    ];
+    server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    server_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+
+    let server_key = rcgen::KeyPair::generate().unwrap();
+    let server_cert = server_params
+        .signed_by(&server_key, &ca_cert, &ca_key)
+        .unwrap();
+
+    (
+        ca_cert.pem(),
+        server_cert.pem(),
+        server_key.serialize_pem(),
+    )
+}
+
+/// Test WSS (WebSocket Secure) connections with TLS using custom CA certificate.
+#[tokio::test]
+async fn test_wss_with_custom_ca() {
+    let runner = DaemonRunner::new();
+
+    // Generate test certificates
+    let (ca_pem, cert_pem, key_pem) = generate_test_certs();
+
+    // Write certificates to temp files
+    let cert_dir = runner.registry_dir.path();
+    let ca_path = cert_dir.join("ca.pem");
+    let cert_path = cert_dir.join("server.crt");
+    let key_path = cert_dir.join("server.key");
+
+    std::fs::File::create(&ca_path)
+        .unwrap()
+        .write_all(ca_pem.as_bytes())
+        .unwrap();
+    std::fs::File::create(&cert_path)
+        .unwrap()
+        .write_all(cert_pem.as_bytes())
+        .unwrap();
+    std::fs::File::create(&key_path)
+        .unwrap()
+        .write_all(key_pem.as_bytes())
+        .unwrap();
+
+    // 1. Start a TCP listener (the backend server)
+    let backend_server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_server.local_addr().unwrap().port();
+
+    // 2. Find available ports for proxy server and client
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_port = ws_listener.local_addr().unwrap().port();
+    drop(ws_listener);
+
+    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_port = client_listener.local_addr().unwrap().port();
+    drop(client_listener);
+
+    // 3. Start the WSS proxy server daemon with TLS
+    let status = runner.spawn_server(&[
+        "--listen",
+        &format!("127.0.0.1:{}", ws_port),
+        "--default-target",
+        &format!("127.0.0.1:{}", backend_port),
+        "--tls-cert",
+        cert_path.to_str().unwrap(),
+        "--tls-key",
+        key_path.to_str().unwrap(),
+    ]);
+    assert!(status.success(), "WSS server daemon failed to start");
+
+    // 4. Start the proxy client daemon with custom CA cert
+    let status = runner.spawn_client(&[
+        "--listen",
+        &format!("127.0.0.1:{}", client_port),
+        "--server",
+        &format!("wss://127.0.0.1:{}", ws_port),
+        "--tls-ca-cert",
+        ca_path.to_str().unwrap(),
+    ]);
+    assert!(status.success(), "WSS client daemon failed to start");
+
+    // Give daemons time to fully start
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 5. Connect and test bidirectional communication
+    let (connect_result, accept_result) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            TcpStream::connect(format!("127.0.0.1:{}", client_port)),
+        ),
+        tokio::time::timeout(Duration::from_secs(5), backend_server.accept()),
+    );
+
+    let mut client_conn = connect_result
+        .expect("Timeout connecting to proxy client")
+        .expect("Failed to connect to proxy client");
+
+    let (mut backend_conn, _) = accept_result
+        .expect("Timeout waiting for connection on backend")
+        .expect("Failed to accept connection");
+
+    // Client sends to backend
+    let client_msg = b"Hello over WSS!";
+    client_conn.write_all(client_msg).await.unwrap();
+
+    let mut backend_received = vec![0u8; client_msg.len()];
+    backend_conn.read_exact(&mut backend_received).await.unwrap();
+    assert_eq!(backend_received, client_msg);
+
+    // Backend sends to client
+    let backend_msg = b"WSS response!";
+    backend_conn.write_all(backend_msg).await.unwrap();
+
+    let mut client_received = vec![0u8; backend_msg.len()];
+    client_conn.read_exact(&mut client_received).await.unwrap();
+    assert_eq!(client_received, backend_msg);
+}
+
+/// Test WSS connections with --insecure flag (skip certificate verification).
+#[tokio::test]
+async fn test_wss_insecure() {
+    let runner = DaemonRunner::new();
+
+    // Generate test certificates (self-signed, no CA needed for insecure mode)
+    let (_, cert_pem, key_pem) = generate_test_certs();
+
+    // Write certificates to temp files
+    let cert_dir = runner.registry_dir.path();
+    let cert_path = cert_dir.join("server.crt");
+    let key_path = cert_dir.join("server.key");
+
+    std::fs::File::create(&cert_path)
+        .unwrap()
+        .write_all(cert_pem.as_bytes())
+        .unwrap();
+    std::fs::File::create(&key_path)
+        .unwrap()
+        .write_all(key_pem.as_bytes())
+        .unwrap();
+
+    // 1. Start a TCP listener (the backend server)
+    let backend_server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_server.local_addr().unwrap().port();
+
+    // 2. Find available ports
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_port = ws_listener.local_addr().unwrap().port();
+    drop(ws_listener);
+
+    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_port = client_listener.local_addr().unwrap().port();
+    drop(client_listener);
+
+    // 3. Start the WSS proxy server daemon with TLS
+    let status = runner.spawn_server(&[
+        "--listen",
+        &format!("127.0.0.1:{}", ws_port),
+        "--default-target",
+        &format!("127.0.0.1:{}", backend_port),
+        "--tls-cert",
+        cert_path.to_str().unwrap(),
+        "--tls-key",
+        key_path.to_str().unwrap(),
+    ]);
+    assert!(status.success(), "WSS server daemon failed to start");
+
+    // 4. Start the proxy client daemon with --insecure flag
+    let status = runner.spawn_client(&[
+        "--listen",
+        &format!("127.0.0.1:{}", client_port),
+        "--server",
+        &format!("wss://127.0.0.1:{}", ws_port),
+        "--insecure",
+    ]);
+    assert!(status.success(), "WSS client daemon failed to start");
+
+    // Give daemons time to fully start
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 5. Connect and test communication
+    let (connect_result, accept_result) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            TcpStream::connect(format!("127.0.0.1:{}", client_port)),
+        ),
+        tokio::time::timeout(Duration::from_secs(5), backend_server.accept()),
+    );
+
+    let mut client_conn = connect_result
+        .expect("Timeout connecting to proxy client")
+        .expect("Failed to connect to proxy client");
+
+    let (mut backend_conn, _) = accept_result
+        .expect("Timeout waiting for connection on backend")
+        .expect("Failed to accept connection");
+
+    // Test roundtrip
+    let test_msg = b"Insecure WSS test message";
+    client_conn.write_all(test_msg).await.unwrap();
+
+    let mut received = vec![0u8; test_msg.len()];
+    backend_conn.read_exact(&mut received).await.unwrap();
+    assert_eq!(received, test_msg);
+
+    // Response
+    let response_msg = b"Insecure WSS response";
+    backend_conn.write_all(response_msg).await.unwrap();
+
+    let mut received = vec![0u8; response_msg.len()];
+    client_conn.read_exact(&mut received).await.unwrap();
+    assert_eq!(received, response_msg);
+}
+
+/// Test WSS with server auto-generated self-signed certificate using --tls-self-signed.
+#[tokio::test]
+async fn test_wss_self_signed_server() {
+    let runner = DaemonRunner::new();
+
+    // 1. Start a TCP listener (the backend server)
+    let backend_server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_server.local_addr().unwrap().port();
+
+    // 2. Find available ports
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_port = ws_listener.local_addr().unwrap().port();
+    drop(ws_listener);
+
+    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_port = client_listener.local_addr().unwrap().port();
+    drop(client_listener);
+
+    // 3. Start the WSS proxy server daemon with auto-generated self-signed cert
+    let status = runner.spawn_server(&[
+        "--listen",
+        &format!("127.0.0.1:{}", ws_port),
+        "--default-target",
+        &format!("127.0.0.1:{}", backend_port),
+        "--tls-self-signed",
+    ]);
+    assert!(status.success(), "WSS server daemon with --tls-self-signed failed to start");
+
+    // 4. Start the proxy client daemon with --insecure flag (required for auto-generated cert)
+    let status = runner.spawn_client(&[
+        "--listen",
+        &format!("127.0.0.1:{}", client_port),
+        "--server",
+        &format!("wss://127.0.0.1:{}", ws_port),
+        "--insecure",
+    ]);
+    assert!(status.success(), "WSS client daemon failed to start");
+
+    // Give daemons time to fully start
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 5. Connect and test communication
+    let (connect_result, accept_result) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            TcpStream::connect(format!("127.0.0.1:{}", client_port)),
+        ),
+        tokio::time::timeout(Duration::from_secs(5), backend_server.accept()),
+    );
+
+    let mut client_conn = connect_result
+        .expect("Timeout connecting to proxy client")
+        .expect("Failed to connect to proxy client");
+
+    let (mut backend_conn, _) = accept_result
+        .expect("Timeout waiting for connection on backend")
+        .expect("Failed to accept connection");
+
+    // Test roundtrip
+    let test_msg = b"Self-signed WSS test message";
+    client_conn.write_all(test_msg).await.unwrap();
+
+    let mut received = vec![0u8; test_msg.len()];
+    backend_conn.read_exact(&mut received).await.unwrap();
+    assert_eq!(received, test_msg);
+
+    // Response
+    let response_msg = b"Self-signed WSS response";
+    backend_conn.write_all(response_msg).await.unwrap();
+
+    let mut received = vec![0u8; response_msg.len()];
+    client_conn.read_exact(&mut received).await.unwrap();
+    assert_eq!(received, response_msg);
 }

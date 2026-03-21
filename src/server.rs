@@ -7,12 +7,38 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::error::{Error, Result};
+
+/// TLS configuration for the server
+#[derive(Debug, Clone)]
+pub enum TlsConfig {
+    /// Load certificate and key from files
+    Files {
+        /// Path to the certificate file (PEM format)
+        cert_path: String,
+        /// Path to the private key file (PEM format)
+        key_path: String,
+    },
+    /// Generate a self-signed certificate
+    SelfSigned,
+}
+
+/// TLS mode for the run() convenience function
+#[derive(Debug, Clone)]
+pub enum TlsMode<'a> {
+    /// No TLS (plain WebSocket)
+    None,
+    /// Load certificate and key from files
+    Files { cert: &'a str, key: &'a str },
+    /// Generate a self-signed certificate
+    SelfSigned,
+}
 
 /// Run a proxy server with the given configuration.
 ///
@@ -23,20 +49,29 @@ use crate::error::{Error, Result};
 /// * `listen` - Address to listen for WebSocket connections (e.g., "0.0.0.0:8080")
 /// * `routes` - Route mappings in "path=target" format (e.g., "/ssh=127.0.0.1:22")
 /// * `default_target` - Default target for paths that don't match any route
+/// * `tls` - TLS mode (None, Files, or SelfSigned)
 ///
 /// # Example
 ///
 /// ```no_run
 /// # async fn example() -> wsproxy::Result<()> {
+/// use wsproxy::server::TlsMode;
+///
 /// wsproxy::server::run(
 ///     "0.0.0.0:8080",
 ///     &["/ssh=127.0.0.1:22".to_string()],
 ///     Some("127.0.0.1:22"),
+///     TlsMode::None,
 /// ).await?;
 /// # Ok(())
 /// # }
 /// ```
-pub async fn run(listen: &str, routes: &[String], default_target: Option<&str>) -> Result<()> {
+pub async fn run(
+    listen: &str,
+    routes: &[String],
+    default_target: Option<&str>,
+    tls: TlsMode<'_>,
+) -> Result<()> {
     let mut builder = ProxyServer::builder();
 
     // Add routes
@@ -55,9 +90,25 @@ pub async fn run(listen: &str, routes: &[String], default_target: Option<&str>) 
         builder = builder.default_target(target)?;
     }
 
+    // Set TLS config if provided
+    let is_tls = !matches!(tls, TlsMode::None);
+    match tls {
+        TlsMode::None => {}
+        TlsMode::Files { cert, key } => {
+            builder = builder.tls(cert, key);
+        }
+        TlsMode::SelfSigned => {
+            builder = builder.tls_self_signed();
+        }
+    }
+
     let server = builder.bind(listen)?;
 
-    eprintln!("Proxy server listening on {}", listen);
+    if is_tls {
+        eprintln!("Proxy server listening on {} (WSS)", listen);
+    } else {
+        eprintln!("Proxy server listening on {}", listen);
+    }
 
     server.run().await
 }
@@ -81,6 +132,12 @@ pub async fn run(listen: &str, routes: &[String], default_target: Option<&str>) 
 ///     .route("/db", "127.0.0.1:5432")?
 ///     .route("/redis", "127.0.0.1:6379")?
 ///     .bind("0.0.0.0:8080")?;
+///
+/// // Server with TLS (WSS)
+/// let server = ProxyServer::builder()
+///     .default_target("127.0.0.1:22")?
+///     .tls("cert.pem", "key.pem")
+///     .bind("0.0.0.0:8443")?;
 /// # Ok(())
 /// # }
 /// ```
@@ -88,6 +145,7 @@ pub async fn run(listen: &str, routes: &[String], default_target: Option<&str>) 
 pub struct ProxyServerBuilder {
     routes: HashMap<String, SocketAddr>,
     default_target: Option<SocketAddr>,
+    tls_config: Option<TlsConfig>,
 }
 
 impl ProxyServerBuilder {
@@ -109,6 +167,27 @@ impl ProxyServerBuilder {
         Ok(self)
     }
 
+    /// Enable TLS (WSS) with the given certificate and key files.
+    ///
+    /// Both files should be in PEM format. The certificate file may contain
+    /// the full certificate chain.
+    pub fn tls(mut self, cert_path: impl Into<String>, key_path: impl Into<String>) -> Self {
+        self.tls_config = Some(TlsConfig::Files {
+            cert_path: cert_path.into(),
+            key_path: key_path.into(),
+        });
+        self
+    }
+
+    /// Enable TLS (WSS) with an automatically generated self-signed certificate.
+    ///
+    /// The certificate will be valid for "localhost" and 127.0.0.1.
+    /// This is useful for development/testing but should not be used in production.
+    pub fn tls_self_signed(mut self) -> Self {
+        self.tls_config = Some(TlsConfig::SelfSigned);
+        self
+    }
+
     /// Build the `ProxyServer` bound to the given address.
     ///
     /// # Arguments
@@ -127,11 +206,29 @@ impl ProxyServerBuilder {
             ));
         }
 
+        // Build TLS acceptor if TLS is configured
+        let tls_acceptor = if let Some(tls_config) = &self.tls_config {
+            let (certs, key) = match tls_config {
+                TlsConfig::Files { cert_path, key_path } => load_certs_from_files(cert_path, key_path)?,
+                TlsConfig::SelfSigned => generate_self_signed_cert()?,
+            };
+
+            let config = tokio_rustls::rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .map_err(|e| Error::config(format!("failed to create TLS config: {}", e)))?;
+
+            Some(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
+        } else {
+            None
+        };
+
         Ok(ProxyServer {
             inner: Arc::new(ProxyServerInner {
                 listen_addr,
                 routes: self.routes,
                 default_target: self.default_target,
+                tls_acceptor,
             }),
         })
     }
@@ -143,11 +240,65 @@ fn resolve_addr(addr: impl ToSocketAddrs) -> Result<SocketAddr> {
         .ok_or_else(|| Error::config("could not resolve address"))
 }
 
-#[derive(Debug)]
+fn load_certs_from_files(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    use std::io::BufReader;
+
+    let cert_file = std::fs::File::open(cert_path).map_err(|e| {
+        Error::config(format!("failed to open TLS certificate '{}': {}", cert_path, e))
+    })?;
+    let key_file = std::fs::File::open(key_path).map_err(|e| {
+        Error::config(format!("failed to open TLS key '{}': {}", key_path, e))
+    })?;
+
+    let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| Error::config(format!("failed to parse TLS certificate: {}", e)))?;
+
+    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
+        .map_err(|e| Error::config(format!("failed to parse TLS key: {}", e)))?
+        .ok_or_else(|| Error::config("no private key found in key file"))?;
+
+    Ok((certs, key))
+}
+
+fn generate_self_signed_cert() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyUsagePurpose, SanType};
+
+    let mut params = CertificateParams::default();
+    params.distinguished_name.push(DnType::CommonName, "localhost");
+    params.subject_alt_names = vec![
+        SanType::DnsName("localhost".try_into().map_err(|e| {
+            Error::config(format!("failed to create SAN: {}", e))
+        })?),
+        SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))),
+    ];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+
+    let key_pair = rcgen::KeyPair::generate().map_err(|e| {
+        Error::config(format!("failed to generate key pair: {}", e))
+    })?;
+
+    let cert = params.self_signed(&key_pair).map_err(|e| {
+        Error::config(format!("failed to generate self-signed certificate: {}", e))
+    })?;
+
+    let cert_der = CertificateDer::from(cert.der().to_vec());
+    let key_der = PrivateKeyDer::try_from(key_pair.serialize_der()).map_err(|e| {
+        Error::config(format!("failed to serialize private key: {}", e))
+    })?;
+
+    Ok((vec![cert_der], key_der))
+}
+
 struct ProxyServerInner {
     listen_addr: SocketAddr,
     routes: HashMap<String, SocketAddr>,
     default_target: Option<SocketAddr>,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
 }
 
 /// A WebSocket proxy server that forwards WebSocket connections to TCP.
@@ -173,7 +324,21 @@ impl ProxyServer {
             let inner = Arc::clone(&self.inner);
 
             tokio::spawn(async move {
-                if let Err(e) = handle_ws_connection(stream, inner).await {
+                let result = if let Some(ref tls_acceptor) = inner.tls_acceptor {
+                    // TLS connection
+                    match tls_acceptor.accept(stream).await {
+                        Ok(tls_stream) => handle_ws_connection(tls_stream, &inner).await,
+                        Err(e) => {
+                            eprintln!("TLS handshake failed from {}: {}", peer_addr, e);
+                            return;
+                        }
+                    }
+                } else {
+                    // Plain TCP connection
+                    handle_ws_connection(stream, &inner).await
+                };
+
+                if let Err(e) = result {
                     eprintln!("Error handling connection from {}: {}", peer_addr, e);
                 }
             });
@@ -181,7 +346,10 @@ impl ProxyServer {
     }
 }
 
-async fn handle_ws_connection(stream: TcpStream, inner: Arc<ProxyServerInner>) -> Result<()> {
+async fn handle_ws_connection<S>(stream: S, inner: &ProxyServerInner) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // Extract the path from the WebSocket handshake
     let path = Arc::new(std::sync::Mutex::new(String::new()));
     let path_clone = Arc::clone(&path);

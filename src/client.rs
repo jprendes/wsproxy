@@ -12,6 +12,15 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::error::{Error, Result};
 
+/// TLS options for the client
+#[derive(Debug, Clone, Default)]
+pub struct TlsOptions {
+    /// Skip certificate verification (insecure, for self-signed certificates)
+    pub insecure: bool,
+    /// Path to CA certificate file (PEM format) for verifying self-signed server certificates
+    pub ca_cert_path: Option<String>,
+}
+
 /// Run a proxy client with the given configuration.
 ///
 /// This is a convenience function that builds and runs a `ProxyClient`.
@@ -20,17 +29,18 @@ use crate::error::{Error, Result};
 ///
 /// * `listen` - Address to listen for TCP connections (e.g., "127.0.0.1:2222")
 /// * `server_url` - WebSocket server URL to connect to (e.g., "ws://server:8080/ssh")
+/// * `tls_options` - TLS options for certificate verification
 ///
 /// # Example
 ///
 /// ```no_run
 /// # async fn example() -> wsproxy::Result<()> {
-/// wsproxy::client::run("127.0.0.1:2222", "ws://server:8080/ssh").await?;
+/// wsproxy::client::run("127.0.0.1:2222", "ws://server:8080/ssh", &Default::default()).await?;
 /// # Ok(())
 /// # }
 /// ```
-pub async fn run(listen: &str, server_url: &str) -> Result<()> {
-    let client = ProxyClient::bind(listen, server_url)?;
+pub async fn run(listen: &str, server_url: &str, tls_options: &TlsOptions) -> Result<()> {
+    let client = ProxyClient::bind(listen, server_url, tls_options.clone())?;
 
     eprintln!(
         "Proxy client listening on {}, forwarding to {}",
@@ -44,6 +54,7 @@ pub async fn run(listen: &str, server_url: &str) -> Result<()> {
 struct ProxyClientInner {
     listen_addr: SocketAddr,
     server_url: String,
+    tls_options: TlsOptions,
 }
 
 /// A proxy client that forwards TCP connections through WebSocket.
@@ -57,6 +68,7 @@ struct ProxyClientInner {
 /// let client = ProxyClient::bind(
 ///     "127.0.0.1:2222",
 ///     "ws://proxy-server:8080/ssh",
+///     Default::default(),
 /// )?;
 ///
 /// client.run().await?;
@@ -75,7 +87,12 @@ impl ProxyClient {
     ///
     /// * `listen_addr` - The address to listen for TCP connections.
     /// * `server_url` - The WebSocket server URL to connect to (e.g., "ws://127.0.0.1:8080/ssh").
-    pub fn bind(listen_addr: impl ToSocketAddrs, server_url: impl Into<String>) -> Result<Self> {
+    /// * `tls_options` - TLS options for certificate verification.
+    pub fn bind(
+        listen_addr: impl ToSocketAddrs,
+        server_url: impl Into<String>,
+        tls_options: TlsOptions,
+    ) -> Result<Self> {
         let listen_addr = listen_addr
             .to_socket_addrs()?
             .next()
@@ -85,6 +102,7 @@ impl ProxyClient {
             inner: Arc::new(ProxyClientInner {
                 listen_addr,
                 server_url: server_url.into(),
+                tls_options,
             }),
         })
     }
@@ -98,9 +116,10 @@ impl ProxyClient {
         loop {
             let (stream, peer_addr) = listener.accept().await?;
             let server_url = self.inner.server_url.clone();
+            let tls_options = self.inner.tls_options.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = handle_tcp_connection(stream, &server_url).await {
+                if let Err(e) = handle_tcp_connection(stream, &server_url, &tls_options).await {
                     eprintln!("Error handling connection from {}: {}", peer_addr, e);
                 }
             });
@@ -108,9 +127,158 @@ impl ProxyClient {
     }
 }
 
-async fn handle_tcp_connection(tcp_stream: TcpStream, server_url: &str) -> Result<()> {
-    // Connect to WebSocket server
-    let (ws_stream, _response) = tokio_tungstenite::connect_async(server_url).await?;
+async fn handle_tcp_connection(
+    tcp_stream: TcpStream,
+    server_url: &str,
+    tls_options: &TlsOptions,
+) -> Result<()> {
+    // Connect to WebSocket server (supports both ws:// and wss://)
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let request = server_url.into_client_request()?;
+    let uri = request.uri();
+    let scheme = uri.scheme_str().unwrap_or("ws");
+    let host = uri
+        .host()
+        .ok_or_else(|| Error::config("missing host in URL"))?;
+    let port = uri.port_u16().unwrap_or(if scheme == "wss" { 443 } else { 80 });
+
+    let addr = format!("{}:{}", host, port);
+    let tcp_conn = TcpStream::connect(&addr).await?;
+
+    if scheme == "wss" {
+        // TLS connection
+        use tokio_rustls::rustls::pki_types::ServerName;
+
+        let config = build_tls_config(tls_options)?;
+
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let server_name = ServerName::try_from(host.to_string())
+            .map_err(|e| Error::config(format!("invalid server name: {}", e)))?;
+
+        let tls_stream = connector.connect(server_name, tcp_conn).await?;
+        let (ws_stream, _response) = tokio_tungstenite::client_async(request, tls_stream).await?;
+        forward_ws_tcp(ws_stream, tcp_stream).await
+    } else {
+        // Plain TCP connection
+        let (ws_stream, _response) = tokio_tungstenite::client_async(request, tcp_conn).await?;
+        forward_ws_tcp(ws_stream, tcp_stream).await
+    }
+}
+
+/// Build TLS client configuration based on options
+fn build_tls_config(
+    tls_options: &TlsOptions,
+) -> Result<tokio_rustls::rustls::ClientConfig> {
+    use tokio_rustls::rustls::client::danger::{
+        HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+    };
+    use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use tokio_rustls::rustls::{DigitallySignedStruct, SignatureScheme};
+
+    if tls_options.insecure {
+        // Skip certificate verification (dangerous!)
+        #[derive(Debug)]
+        struct InsecureVerifier;
+
+        impl ServerCertVerifier for InsecureVerifier {
+            fn verify_server_cert(
+                &self,
+                _end_entity: &CertificateDer<'_>,
+                _intermediates: &[CertificateDer<'_>],
+                _server_name: &ServerName<'_>,
+                _ocsp_response: &[u8],
+                _now: UnixTime,
+            ) -> std::result::Result<ServerCertVerified, tokio_rustls::rustls::Error> {
+                Ok(ServerCertVerified::assertion())
+            }
+
+            fn verify_tls12_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> std::result::Result<HandshakeSignatureValid, tokio_rustls::rustls::Error>
+            {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+
+            fn verify_tls13_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> std::result::Result<HandshakeSignatureValid, tokio_rustls::rustls::Error>
+            {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                vec![
+                    SignatureScheme::RSA_PKCS1_SHA256,
+                    SignatureScheme::RSA_PKCS1_SHA384,
+                    SignatureScheme::RSA_PKCS1_SHA512,
+                    SignatureScheme::ECDSA_NISTP256_SHA256,
+                    SignatureScheme::ECDSA_NISTP384_SHA384,
+                    SignatureScheme::ECDSA_NISTP521_SHA512,
+                    SignatureScheme::RSA_PSS_SHA256,
+                    SignatureScheme::RSA_PSS_SHA384,
+                    SignatureScheme::RSA_PSS_SHA512,
+                    SignatureScheme::ED25519,
+                ]
+            }
+        }
+
+        let config = tokio_rustls::rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(InsecureVerifier))
+            .with_no_client_auth();
+
+        Ok(config)
+    } else if let Some(ca_cert_path) = &tls_options.ca_cert_path {
+        // Use custom CA certificate
+        use std::io::BufReader;
+
+        let ca_file = std::fs::File::open(ca_cert_path).map_err(|e| {
+            Error::config(format!("failed to open CA certificate '{}': {}", ca_cert_path, e))
+        })?;
+
+        let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(ca_file))
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| Error::config(format!("failed to parse CA certificate: {}", e)))?;
+
+        let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
+        for cert in certs {
+            root_store.add(cert).map_err(|e| {
+                Error::config(format!("failed to add CA certificate to root store: {}", e))
+            })?;
+        }
+
+        let config = tokio_rustls::rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        Ok(config)
+    } else {
+        // Use system root certificates
+        let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let config = tokio_rustls::rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        Ok(config)
+    }
+}
+
+async fn forward_ws_tcp<S>(
+    ws_stream: tokio_tungstenite::WebSocketStream<S>,
+    tcp_stream: TcpStream,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let (mut ws_write, mut ws_read) = ws_stream.split();
 
     // Split TCP stream

@@ -134,6 +134,9 @@ pub fn spawn_server(
     listen: String,
     route: Vec<String>,
     default_target: Option<String>,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    tls_self_signed: bool,
 ) -> wsproxy::Result<()> {
     let mut args = vec!["server".to_string(), "--listen".to_string(), listen];
 
@@ -147,18 +150,46 @@ pub fn spawn_server(
         args.push(target.clone());
     }
 
+    if let Some(cert) = &tls_cert {
+        args.push("--tls-cert".to_string());
+        args.push(cert.clone());
+    }
+
+    if let Some(key) = &tls_key {
+        args.push("--tls-key".to_string());
+        args.push(key.clone());
+    }
+
+    if tls_self_signed {
+        args.push("--tls-self-signed".to_string());
+    }
+
     spawn_daemon(DaemonRole::Server, args)
 }
 
 /// Spawn a detached daemon process for client
-pub fn spawn_client(listen: String, server: String) -> wsproxy::Result<()> {
-    let args = vec![
+pub fn spawn_client(
+    listen: String,
+    server: String,
+    insecure: bool,
+    tls_ca_cert: Option<String>,
+) -> wsproxy::Result<()> {
+    let mut args = vec![
         "client".to_string(),
         "--listen".to_string(),
         listen,
         "--server".to_string(),
         server,
     ];
+
+    if insecure {
+        args.push("--insecure".to_string());
+    }
+
+    if let Some(ca_cert) = &tls_ca_cert {
+        args.push("--tls-ca-cert".to_string());
+        args.push(ca_cert.clone());
+    }
 
     spawn_daemon(DaemonRole::Client, args)
 }
