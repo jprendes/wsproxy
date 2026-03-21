@@ -113,31 +113,6 @@ pub(crate) fn write(daemons: &[DaemonInfo]) -> std::io::Result<()> {
     fs::write(&path, content)
 }
 
-/// Register a new daemon in the registry
-pub(crate) fn register(role: DaemonRole, pid: u32, args: Vec<String>) -> std::io::Result<u32> {
-    let _lock = FileLock::acquire()?;
-    let mut daemons = read();
-
-    // Find next available ID
-    let id = daemons.iter().map(|d| d.id).max().unwrap_or(0) + 1;
-
-    let started_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    daemons.push(DaemonInfo {
-        id,
-        pid,
-        role,
-        args,
-        started_at,
-    });
-
-    write(&daemons)?;
-    Ok(id)
-}
-
 /// Unregister a daemon from the registry
 pub(crate) fn unregister(id: u32) -> std::io::Result<()> {
     let _lock = FileLock::acquire()?;

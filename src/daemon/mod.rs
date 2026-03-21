@@ -168,30 +168,15 @@ fn spawn_daemon(role: DaemonRole, args: Vec<String>) -> wsproxy::Result<()> {
     let exe = std::env::current_exe()
         .map_err(|e| wsproxy::Error::config(format!("Failed to get current executable: {}", e)))?;
 
-    // First spawn to get PID and register
-    let mut cmd = Command::new(&exe);
-    cmd.arg("daemon");
-    cmd.args(&args);
-    cmd.env(DAEMON_ENV_VAR, "1");
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::inherit());
+    // Pre-allocate the daemon ID
+    let id = {
+        let _lock = registry::FileLock::acquire()
+            .map_err(|e| wsproxy::Error::config(format!("Failed to acquire lock: {}", e)))?;
+        let daemons = registry::read();
+        daemons.iter().map(|d| d.id).max().unwrap_or(0) + 1
+    };
 
-    let child = cmd
-        .spawn()
-        .map_err(|e| wsproxy::Error::config(format!("Failed to spawn daemon process: {}", e)))?;
-
-    let pid = child.id();
-
-    // Register in the registry
-    let id = registry::register(role, pid, args.clone())
-        .map_err(|e| wsproxy::Error::config(format!("Failed to register daemon: {}", e)))?;
-
-    // Kill the first spawn and respawn with the ID
-    registry::kill_process(pid);
-    std::thread::sleep(Duration::from_millis(100));
-
-    // Respawn with the daemon ID for cleanup support
+    // Spawn the daemon with its ID already set
     let mut cmd = Command::new(&exe);
     cmd.arg("daemon");
     cmd.args(&args);
@@ -205,19 +190,32 @@ fn spawn_daemon(role: DaemonRole, args: Vec<String>) -> wsproxy::Result<()> {
         .spawn()
         .map_err(|e| wsproxy::Error::config(format!("Failed to spawn daemon process: {}", e)))?;
 
-    // Update registry with new PID
+    let pid = child.id();
+
+    // Register in the registry with the actual PID
     {
         let _lock = registry::FileLock::acquire()
             .map_err(|e| wsproxy::Error::config(format!("Failed to acquire lock: {}", e)))?;
         let mut daemons = registry::read();
-        if let Some(d) = daemons.iter_mut().find(|d| d.id == id) {
-            d.pid = child.id();
-        }
+
+        let started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        daemons.push(registry::DaemonInfo {
+            id,
+            pid,
+            role,
+            args: args.clone(),
+            started_at,
+        });
+
         registry::write(&daemons)
             .map_err(|e| wsproxy::Error::config(format!("Failed to write registry: {}", e)))?;
     }
 
-    eprintln!("Daemon started with ID {} (PID {})", id, child.id());
+    eprintln!("Daemon started with ID {} (PID {})", id, pid);
 
     Ok(())
 }
