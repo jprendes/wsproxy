@@ -230,3 +230,167 @@ async fn test_large_data_transfer() {
 
     assert_eq!(response, large_data);
 }
+
+/// Test bidirectional "chat" communication through the proxy using daemon mode.
+/// This mimics the netcat example from the README where two parties
+/// can send messages to each other through the WebSocket proxy.
+#[tokio::test]
+async fn test_bidirectional_chat_daemon() {
+    use std::process::{Command, Stdio};
+
+    let wsproxy = env!("CARGO_BIN_EXE_wsproxy");
+
+    // Clean up any existing daemons first
+    let _ = Command::new(wsproxy).args(["daemon", "list"]).output();
+
+    // 1. Start a TCP listener (the "chat server" - like `nc -l 9000`)
+    let chat_server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chat_server_port = chat_server.local_addr().unwrap().port();
+
+    // 2. Find available ports for proxy server and client
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_port = ws_listener.local_addr().unwrap().port();
+    drop(ws_listener);
+
+    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_port = client_listener.local_addr().unwrap().port();
+    drop(client_listener);
+
+    // 3. Start the proxy server daemon
+    // Use spawn() instead of output() because the daemon child inherits stderr,
+    // which would cause output() to block waiting for the child to exit.
+    let status = Command::new(wsproxy)
+        .args([
+            "daemon",
+            "server",
+            "--listen",
+            &format!("127.0.0.1:{}", ws_port),
+            "--default-target",
+            &format!("127.0.0.1:{}", chat_server_port),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("Failed to start server daemon");
+
+    assert!(status.success(), "Server daemon failed");
+
+    // 4. Start the proxy client daemon
+    let status = Command::new(wsproxy)
+        .args([
+            "daemon",
+            "client",
+            "--listen",
+            &format!("127.0.0.1:{}", client_port),
+            "--server",
+            &format!("ws://127.0.0.1:{}", ws_port),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("Failed to start client daemon");
+
+    assert!(status.success(), "Client daemon failed");
+
+    // Give daemons time to fully start
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 5. Connect to the proxy and accept on chat server SIMULTANEOUSLY
+    // The connect() blocks until the full chain is established, which requires
+    // the chat server to accept the incoming connection from the proxy server.
+    let (connect_result, accept_result) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            TcpStream::connect(format!("127.0.0.1:{}", client_port)),
+        ),
+        tokio::time::timeout(Duration::from_secs(5), chat_server.accept()),
+    );
+
+    let mut chat_client = match connect_result {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
+            cleanup_daemons(wsproxy);
+            panic!("Failed to connect to proxy client: {}", e);
+        }
+        Err(_) => {
+            cleanup_daemons(wsproxy);
+            panic!("Timeout connecting to proxy client");
+        }
+    };
+
+    let mut chat_server_conn = match accept_result {
+        Ok(Ok((stream, _))) => stream,
+        Ok(Err(e)) => {
+            cleanup_daemons(wsproxy);
+            panic!("Failed to accept connection: {}", e);
+        }
+        Err(_) => {
+            cleanup_daemons(wsproxy);
+            panic!("Timeout waiting for connection on chat server");
+        }
+    };
+
+    // Test bidirectional communication
+
+    // Client sends to server
+    let client_msg = b"Hello from client!";
+    chat_client.write_all(client_msg).await.unwrap();
+
+    let mut server_received = vec![0u8; client_msg.len()];
+    chat_server_conn
+        .read_exact(&mut server_received)
+        .await
+        .unwrap();
+    assert_eq!(server_received, client_msg);
+
+    // Server sends to client
+    let server_msg = b"Hello from server!";
+    chat_server_conn.write_all(server_msg).await.unwrap();
+
+    let mut client_received = vec![0u8; server_msg.len()];
+    chat_client.read_exact(&mut client_received).await.unwrap();
+    assert_eq!(client_received, server_msg);
+
+    // Multiple back-and-forth messages (like a real chat)
+    for i in 0..5 {
+        // Client -> Server
+        let msg = format!("Client message {}\n", i);
+        chat_client.write_all(msg.as_bytes()).await.unwrap();
+
+        let mut received = vec![0u8; msg.len()];
+        chat_server_conn.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, msg.as_bytes());
+
+        // Server -> Client
+        let reply = format!("Server reply {}\n", i);
+        chat_server_conn.write_all(reply.as_bytes()).await.unwrap();
+
+        let mut received = vec![0u8; reply.len()];
+        chat_client.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, reply.as_bytes());
+    }
+
+    // Clean up
+    cleanup_daemons(wsproxy);
+}
+
+fn cleanup_daemons(wsproxy: &str) {
+    use std::process::Command;
+
+    let output = Command::new(wsproxy)
+        .args(["daemon", "list"])
+        .output()
+        .expect("Failed to list daemons");
+
+    let list_output = String::from_utf8_lossy(&output.stdout);
+    for line in list_output.lines().skip(2) {
+        if let Some(id) = line.split_whitespace().next() {
+            if id.parse::<u32>().is_ok() {
+                Command::new(wsproxy)
+                    .args(["daemon", "kill", id])
+                    .output()
+                    .ok();
+            }
+        }
+    }
+}
