@@ -1,0 +1,20 @@
+[package]
+name = "wsproxy"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "WebSocket proxy for TCP connections"
+readme = "README.md"
+homepage = "https://github.com/jprendes/wsproxy"
+repository = "https://github.com/jprendes/wsproxy"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+thiserror = "2"
+
+[[bin]]
+name = "wsproxy"
+path = "src/main.rs"
