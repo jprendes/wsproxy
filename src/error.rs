@@ -1,8 +1,7 @@
 //! Error types for the wsproxy library.
 
 use std::backtrace::{Backtrace, BacktraceStatus};
-use std::fmt;
-use std::io;
+use std::{fmt, io};
 
 /// Result type alias using the library's Error type.
 pub type Result<T> = std::result::Result<T, Error>;

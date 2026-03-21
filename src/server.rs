@@ -36,11 +36,7 @@ use crate::error::{Error, Result};
 /// # Ok(())
 /// # }
 /// ```
-pub async fn run(
-    listen: &str,
-    routes: &[String],
-    default_target: Option<&str>,
-) -> Result<()> {
+pub async fn run(listen: &str, routes: &[String], default_target: Option<&str>) -> Result<()> {
     let mut builder = ProxyServer::builder();
 
     // Add routes
