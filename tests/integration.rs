@@ -231,17 +231,89 @@ async fn test_large_data_transfer() {
     assert_eq!(response, large_data);
 }
 
+const REGISTRY_FILE_ENV: &str = "WSPROXY_REGISTRY_FILE";
+const WSPROXY_BIN: &str = env!("CARGO_BIN_EXE_wsproxy");
+
+/// RAII guard that cleans up daemons on drop
+struct DaemonRunner {
+    registry_dir: tempfile::TempDir,
+}
+
+impl DaemonRunner {
+    fn new() -> Self {
+        Self {
+            registry_dir: tempfile::tempdir().unwrap(),
+        }
+    }
+
+    fn registry_file(&self) -> std::path::PathBuf {
+        self.registry_dir.path().join("daemons.json")
+    }
+
+    fn spawn_server(&self, args: &[&str]) -> std::process::ExitStatus {
+        use std::process::{Command, Stdio};
+
+        let mut full_args = vec!["daemon", "server"];
+        full_args.extend(args);
+
+        Command::new(WSPROXY_BIN)
+            .args(&full_args)
+            .env(REGISTRY_FILE_ENV, self.registry_file())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("Failed to start server daemon")
+    }
+
+    fn spawn_client(&self, args: &[&str]) -> std::process::ExitStatus {
+        use std::process::{Command, Stdio};
+
+        let mut full_args = vec!["daemon", "client"];
+        full_args.extend(args);
+
+        Command::new(WSPROXY_BIN)
+            .args(&full_args)
+            .env(REGISTRY_FILE_ENV, self.registry_file())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("Failed to start client daemon")
+    }
+}
+
+impl Drop for DaemonRunner {
+    fn drop(&mut self) {
+        use std::process::Command;
+
+        let registry_file = self.registry_file();
+        let output = Command::new(WSPROXY_BIN)
+            .args(["daemon", "list"])
+            .env(REGISTRY_FILE_ENV, &registry_file)
+            .output()
+            .expect("Failed to list daemons");
+
+        let list_output = String::from_utf8_lossy(&output.stdout);
+        for line in list_output.lines().skip(2) {
+            if let Some(id) = line.split_whitespace().next() {
+                if id.parse::<u32>().is_ok() {
+                    Command::new(WSPROXY_BIN)
+                        .args(["daemon", "kill", id])
+                        .env(REGISTRY_FILE_ENV, &registry_file)
+                        .output()
+                        .ok();
+                }
+            }
+        }
+        // tempfile::TempDir handles file cleanup automatically
+    }
+}
+
 /// Test bidirectional "chat" communication through the proxy using daemon mode.
 /// This mimics the netcat example from the README where two parties
 /// can send messages to each other through the WebSocket proxy.
 #[tokio::test]
 async fn test_bidirectional_chat_daemon() {
-    use std::process::{Command, Stdio};
-
-    let wsproxy = env!("CARGO_BIN_EXE_wsproxy");
-
-    // Clean up any existing daemons first
-    let _ = Command::new(wsproxy).args(["daemon", "list"]).output();
+    let runner = DaemonRunner::new();
 
     // 1. Start a TCP listener (the "chat server" - like `nc -l 9000`)
     let chat_server = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -257,39 +329,21 @@ async fn test_bidirectional_chat_daemon() {
     drop(client_listener);
 
     // 3. Start the proxy server daemon
-    // Use spawn() instead of output() because the daemon child inherits stderr,
-    // which would cause output() to block waiting for the child to exit.
-    let status = Command::new(wsproxy)
-        .args([
-            "daemon",
-            "server",
-            "--listen",
-            &format!("127.0.0.1:{}", ws_port),
-            "--default-target",
-            &format!("127.0.0.1:{}", chat_server_port),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .expect("Failed to start server daemon");
-
+    let status = runner.spawn_server(&[
+        "--listen",
+        &format!("127.0.0.1:{}", ws_port),
+        "--default-target",
+        &format!("127.0.0.1:{}", chat_server_port),
+    ]);
     assert!(status.success(), "Server daemon failed");
 
     // 4. Start the proxy client daemon
-    let status = Command::new(wsproxy)
-        .args([
-            "daemon",
-            "client",
-            "--listen",
-            &format!("127.0.0.1:{}", client_port),
-            "--server",
-            &format!("ws://127.0.0.1:{}", ws_port),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .expect("Failed to start client daemon");
-
+    let status = runner.spawn_client(&[
+        "--listen",
+        &format!("127.0.0.1:{}", client_port),
+        "--server",
+        &format!("ws://127.0.0.1:{}", ws_port),
+    ]);
     assert!(status.success(), "Client daemon failed");
 
     // Give daemons time to fully start
@@ -306,29 +360,13 @@ async fn test_bidirectional_chat_daemon() {
         tokio::time::timeout(Duration::from_secs(5), chat_server.accept()),
     );
 
-    let mut chat_client = match connect_result {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => {
-            cleanup_daemons(wsproxy);
-            panic!("Failed to connect to proxy client: {}", e);
-        }
-        Err(_) => {
-            cleanup_daemons(wsproxy);
-            panic!("Timeout connecting to proxy client");
-        }
-    };
+    let mut chat_client = connect_result
+        .expect("Timeout connecting to proxy client")
+        .expect("Failed to connect to proxy client");
 
-    let mut chat_server_conn = match accept_result {
-        Ok(Ok((stream, _))) => stream,
-        Ok(Err(e)) => {
-            cleanup_daemons(wsproxy);
-            panic!("Failed to accept connection: {}", e);
-        }
-        Err(_) => {
-            cleanup_daemons(wsproxy);
-            panic!("Timeout waiting for connection on chat server");
-        }
-    };
+    let (mut chat_server_conn, _) = accept_result
+        .expect("Timeout waiting for connection on chat server")
+        .expect("Failed to accept connection");
 
     // Test bidirectional communication
 
@@ -370,27 +408,5 @@ async fn test_bidirectional_chat_daemon() {
         assert_eq!(received, reply.as_bytes());
     }
 
-    // Clean up
-    cleanup_daemons(wsproxy);
-}
-
-fn cleanup_daemons(wsproxy: &str) {
-    use std::process::Command;
-
-    let output = Command::new(wsproxy)
-        .args(["daemon", "list"])
-        .output()
-        .expect("Failed to list daemons");
-
-    let list_output = String::from_utf8_lossy(&output.stdout);
-    for line in list_output.lines().skip(2) {
-        if let Some(id) = line.split_whitespace().next() {
-            if id.parse::<u32>().is_ok() {
-                Command::new(wsproxy)
-                    .args(["daemon", "kill", id])
-                    .output()
-                    .ok();
-            }
-        }
-    }
+    // runner dropped here, cleans up daemons automatically
 }

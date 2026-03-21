@@ -35,8 +35,14 @@ pub struct DaemonInfo {
     pub started_at: u64, // Unix timestamp
 }
 
+/// Environment variable to override the registry file path
+pub const REGISTRY_FILE_ENV: &str = "WSPROXY_REGISTRY_FILE";
+
 /// Get the path to the daemon registry file
 fn registry_path() -> PathBuf {
+    if let Ok(path) = std::env::var(REGISTRY_FILE_ENV) {
+        return PathBuf::from(path);
+    }
     let mut path = std::env::temp_dir();
     path.push("wsproxy");
     fs::create_dir_all(&path).ok();
