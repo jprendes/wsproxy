@@ -53,9 +53,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Add routes
             for r in route {
-                let (path, target) = r
-                    .split_once('=')
-                    .ok_or_else(|| format!("Invalid route format '{}', expected 'path=target'", r))?;
+                let (path, target) = r.split_once('=').ok_or_else(|| {
+                    format!("Invalid route format '{}', expected 'path=target'", r)
+                })?;
                 builder = builder.route(path, target)?;
             }
 
@@ -73,7 +73,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Client { listen, server } => {
             let client = ProxyClient::bind(&listen, &server)?;
 
-            eprintln!("Proxy client listening on {}, forwarding to {}", listen, server);
+            eprintln!(
+                "Proxy client listening on {}, forwarding to {}",
+                listen, server
+            );
             client.run().await?;
         }
     }

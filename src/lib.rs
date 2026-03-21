@@ -58,4 +58,3 @@ mod server;
 pub use client::ProxyClient;
 pub use error::{Error, Result};
 pub use server::{ProxyServer, ProxyServerBuilder};
-

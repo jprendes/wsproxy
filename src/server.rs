@@ -49,11 +49,7 @@ impl ProxyServerBuilder {
     }
 
     /// Add a route mapping a URL path to a TCP target address.
-    pub fn route(
-        mut self,
-        path: impl Into<String>,
-        target: impl ToSocketAddrs,
-    ) -> Result<Self> {
+    pub fn route(mut self, path: impl Into<String>, target: impl ToSocketAddrs) -> Result<Self> {
         let target = resolve_addr(target)?;
         self.routes.insert(path.into(), target);
         Ok(self)
