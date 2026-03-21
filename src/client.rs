@@ -12,6 +12,34 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::error::{Error, Result};
 
+/// Run a proxy client with the given configuration.
+///
+/// This is a convenience function that builds and runs a `ProxyClient`.
+///
+/// # Arguments
+///
+/// * `listen` - Address to listen for TCP connections (e.g., "127.0.0.1:2222")
+/// * `server_url` - WebSocket server URL to connect to (e.g., "ws://server:8080/ssh")
+///
+/// # Example
+///
+/// ```no_run
+/// # async fn example() -> wsproxy::Result<()> {
+/// wsproxy::client::run("127.0.0.1:2222", "ws://server:8080/ssh").await?;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn run(listen: &str, server_url: &str) -> Result<()> {
+    let client = ProxyClient::bind(listen, server_url)?;
+
+    eprintln!(
+        "Proxy client listening on {}, forwarding to {}",
+        listen, server_url
+    );
+
+    client.run().await
+}
+
 #[derive(Debug)]
 struct ProxyClientInner {
     listen_addr: SocketAddr,
@@ -51,7 +79,7 @@ impl ProxyClient {
         let listen_addr = listen_addr
             .to_socket_addrs()?
             .next()
-            .ok_or_else(|| Error::Config("could not resolve address".to_string()))?;
+            .ok_or_else(|| Error::config("could not resolve address"))?;
 
         Ok(Self {
             inner: Arc::new(ProxyClientInner {
@@ -120,7 +148,7 @@ async fn handle_tcp_connection(tcp_stream: TcpStream, server_url: &str) -> Resul
                     // Handled by the library or ignored
                 }
                 Err(e) => {
-                    return Err(Error::WebSocket(e));
+                    return Err(e.into());
                 }
             }
         }

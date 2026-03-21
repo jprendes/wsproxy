@@ -51,9 +51,9 @@
 //! }
 //! ```
 
-mod client;
+pub mod client;
 mod error;
-mod server;
+pub mod server;
 
 pub use client::ProxyClient;
 pub use error::{Error, Result};

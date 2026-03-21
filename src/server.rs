@@ -14,6 +14,58 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::error::{Error, Result};
 
+/// Run a proxy server with the given configuration.
+///
+/// This is a convenience function that builds and runs a `ProxyServer`.
+///
+/// # Arguments
+///
+/// * `listen` - Address to listen for WebSocket connections (e.g., "0.0.0.0:8080")
+/// * `routes` - Route mappings in "path=target" format (e.g., "/ssh=127.0.0.1:22")
+/// * `default_target` - Default target for paths that don't match any route
+///
+/// # Example
+///
+/// ```no_run
+/// # async fn example() -> wsproxy::Result<()> {
+/// wsproxy::server::run(
+///     "0.0.0.0:8080",
+///     &["/ssh=127.0.0.1:22".to_string()],
+///     Some("127.0.0.1:22"),
+/// ).await?;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn run(
+    listen: &str,
+    routes: &[String],
+    default_target: Option<&str>,
+) -> Result<()> {
+    let mut builder = ProxyServer::builder();
+
+    // Add routes
+    for r in routes {
+        let (path, target) = r.split_once('=').ok_or_else(|| {
+            Error::config(format!(
+                "Invalid route format '{}', expected 'path=target'",
+                r
+            ))
+        })?;
+        builder = builder.route(path, target)?;
+    }
+
+    // Set default target if provided
+    if let Some(target) = default_target {
+        builder = builder.default_target(target)?;
+    }
+
+    let server = builder.bind(listen)?;
+
+    eprintln!("Proxy server listening on {}", listen);
+
+    server.run().await
+}
+
 /// Builder for creating a `ProxyServer`.
 ///
 /// # Example
@@ -74,8 +126,8 @@ impl ProxyServerBuilder {
         let listen_addr = resolve_addr(listen_addr)?;
 
         if self.routes.is_empty() && self.default_target.is_none() {
-            return Err(Error::Config(
-                "at least one route or a default_target is required".to_string(),
+            return Err(Error::config(
+                "at least one route or a default_target is required",
             ));
         }
 
@@ -92,7 +144,7 @@ impl ProxyServerBuilder {
 fn resolve_addr(addr: impl ToSocketAddrs) -> Result<SocketAddr> {
     addr.to_socket_addrs()?
         .next()
-        .ok_or_else(|| Error::Config("could not resolve address".to_string()))
+        .ok_or_else(|| Error::config("could not resolve address"))
 }
 
 #[derive(Debug)]
@@ -159,7 +211,7 @@ async fn handle_ws_connection(stream: TcpStream, inner: Arc<ProxyServerInner>) -
             inner.routes.get(normalized)
         })
         .or(inner.default_target.as_ref())
-        .ok_or_else(|| Error::NoRouteFound(request_path.clone()))?;
+        .ok_or_else(|| Error::no_route_found(request_path.clone()))?;
     let target_addr = *target_addr;
     let (mut ws_write, mut ws_read) = ws_stream.split();
 
@@ -191,7 +243,7 @@ async fn handle_ws_connection(stream: TcpStream, inner: Arc<ProxyServerInner>) -
                     // Raw frames, ignore
                 }
                 Err(e) => {
-                    return Err(Error::WebSocket(e));
+                    return Err(e.into());
                 }
             }
         }
