@@ -209,7 +209,10 @@ impl ProxyServerBuilder {
         // Build TLS acceptor if TLS is configured
         let tls_acceptor = if let Some(tls_config) = &self.tls_config {
             let (certs, key) = match tls_config {
-                TlsConfig::Files { cert_path, key_path } => load_certs_from_files(cert_path, key_path)?,
+                TlsConfig::Files {
+                    cert_path,
+                    key_path,
+                } => load_certs_from_files(cert_path, key_path)?,
                 TlsConfig::SelfSigned => generate_self_signed_cert()?,
             };
 
@@ -247,11 +250,13 @@ fn load_certs_from_files(
     use std::io::BufReader;
 
     let cert_file = std::fs::File::open(cert_path).map_err(|e| {
-        Error::config(format!("failed to open TLS certificate '{}': {}", cert_path, e))
+        Error::config(format!(
+            "failed to open TLS certificate '{}': {}",
+            cert_path, e
+        ))
     })?;
-    let key_file = std::fs::File::open(key_path).map_err(|e| {
-        Error::config(format!("failed to open TLS key '{}': {}", key_path, e))
-    })?;
+    let key_file = std::fs::File::open(key_path)
+        .map_err(|e| Error::config(format!("failed to open TLS key '{}': {}", key_path, e)))?;
 
     let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
         .collect::<std::result::Result<_, _>>()
@@ -268,28 +273,30 @@ fn generate_self_signed_cert() -> Result<(Vec<CertificateDer<'static>>, PrivateK
     use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyUsagePurpose, SanType};
 
     let mut params = CertificateParams::default();
-    params.distinguished_name.push(DnType::CommonName, "localhost");
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "localhost");
     params.subject_alt_names = vec![
-        SanType::DnsName("localhost".try_into().map_err(|e| {
-            Error::config(format!("failed to create SAN: {}", e))
-        })?),
+        SanType::DnsName(
+            "localhost"
+                .try_into()
+                .map_err(|e| Error::config(format!("failed to create SAN: {}", e)))?,
+        ),
         SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))),
     ];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
 
-    let key_pair = rcgen::KeyPair::generate().map_err(|e| {
-        Error::config(format!("failed to generate key pair: {}", e))
-    })?;
+    let key_pair = rcgen::KeyPair::generate()
+        .map_err(|e| Error::config(format!("failed to generate key pair: {}", e)))?;
 
-    let cert = params.self_signed(&key_pair).map_err(|e| {
-        Error::config(format!("failed to generate self-signed certificate: {}", e))
-    })?;
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|e| Error::config(format!("failed to generate self-signed certificate: {}", e)))?;
 
     let cert_der = CertificateDer::from(cert.der().to_vec());
-    let key_der = PrivateKeyDer::try_from(key_pair.serialize_der()).map_err(|e| {
-        Error::config(format!("failed to serialize private key: {}", e))
-    })?;
+    let key_der = PrivateKeyDer::try_from(key_pair.serialize_der())
+        .map_err(|e| Error::config(format!("failed to serialize private key: {}", e)))?;
 
     Ok((vec![cert_der], key_der))
 }

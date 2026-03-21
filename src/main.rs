@@ -211,7 +211,14 @@ async fn run() -> wsproxy::Result<()> {
                 tls_key,
                 tls_self_signed,
             } => {
-                daemon::spawn_server(listen, route, default_target, tls_cert, tls_key, tls_self_signed)?;
+                daemon::spawn_server(
+                    listen,
+                    route,
+                    default_target,
+                    tls_cert,
+                    tls_key,
+                    tls_self_signed,
+                )?;
             }
 
             DaemonAction::Client {

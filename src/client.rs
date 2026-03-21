@@ -141,7 +141,9 @@ async fn handle_tcp_connection(
     let host = uri
         .host()
         .ok_or_else(|| Error::config("missing host in URL"))?;
-    let port = uri.port_u16().unwrap_or(if scheme == "wss" { 443 } else { 80 });
+    let port = uri
+        .port_u16()
+        .unwrap_or(if scheme == "wss" { 443 } else { 80 });
 
     let addr = format!("{}:{}", host, port);
     let tcp_conn = TcpStream::connect(&addr).await?;
@@ -167,9 +169,7 @@ async fn handle_tcp_connection(
 }
 
 /// Build TLS client configuration based on options
-fn build_tls_config(
-    tls_options: &TlsOptions,
-) -> Result<tokio_rustls::rustls::ClientConfig> {
+fn build_tls_config(tls_options: &TlsOptions) -> Result<tokio_rustls::rustls::ClientConfig> {
     use tokio_rustls::rustls::client::danger::{
         HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
     };
@@ -240,7 +240,10 @@ fn build_tls_config(
         use std::io::BufReader;
 
         let ca_file = std::fs::File::open(ca_cert_path).map_err(|e| {
-            Error::config(format!("failed to open CA certificate '{}': {}", ca_cert_path, e))
+            Error::config(format!(
+                "failed to open CA certificate '{}': {}",
+                ca_cert_path, e
+            ))
         })?;
 
         let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(ca_file))

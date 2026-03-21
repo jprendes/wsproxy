@@ -450,11 +450,7 @@ fn generate_test_certs() -> (String, String, String) {
         .signed_by(&server_key, &ca_cert, &ca_key)
         .unwrap();
 
-    (
-        ca_cert.pem(),
-        server_cert.pem(),
-        server_key.serialize_pem(),
-    )
+    (ca_cert.pem(), server_cert.pem(), server_key.serialize_pem())
 }
 
 /// Test WSS (WebSocket Secure) connections with TLS using custom CA certificate.
@@ -546,7 +542,10 @@ async fn test_wss_with_custom_ca() {
     client_conn.write_all(client_msg).await.unwrap();
 
     let mut backend_received = vec![0u8; client_msg.len()];
-    backend_conn.read_exact(&mut backend_received).await.unwrap();
+    backend_conn
+        .read_exact(&mut backend_received)
+        .await
+        .unwrap();
     assert_eq!(backend_received, client_msg);
 
     // Backend sends to client
@@ -679,7 +678,10 @@ async fn test_wss_self_signed_server() {
         &format!("127.0.0.1:{}", backend_port),
         "--tls-self-signed",
     ]);
-    assert!(status.success(), "WSS server daemon with --tls-self-signed failed to start");
+    assert!(
+        status.success(),
+        "WSS server daemon with --tls-self-signed failed to start"
+    );
 
     // 4. Start the proxy client daemon with --insecure flag (required for auto-generated cert)
     let status = runner.spawn_client(&[
