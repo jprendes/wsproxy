@@ -299,14 +299,14 @@ impl Drop for DaemonRunner {
 
         let list_output = String::from_utf8_lossy(&output.stdout);
         for line in list_output.lines().skip(2) {
-            if let Some(id) = line.split_whitespace().next() {
-                if id.parse::<u32>().is_ok() {
-                    Command::new(WSPROXY_BIN)
-                        .args(["daemon", "kill", id])
-                        .env(REGISTRY_FILE_ENV, &registry_file)
-                        .output()
-                        .ok();
-                }
+            if let Some(id) = line.split_whitespace().next()
+                && id.parse::<u32>().is_ok()
+            {
+                Command::new(WSPROXY_BIN)
+                    .args(["daemon", "kill", id])
+                    .env(REGISTRY_FILE_ENV, &registry_file)
+                    .output()
+                    .ok();
             }
         }
         // tempfile::TempDir handles file cleanup automatically
