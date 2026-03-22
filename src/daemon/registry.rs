@@ -33,6 +33,9 @@ pub struct DaemonInfo {
     pub role: DaemonRole,
     pub args: Vec<String>,
     pub started_at: u64, // Unix timestamp
+    /// Actual port the daemon is listening on (set after binding)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
 }
 
 /// Environment variable to override the registry file path
@@ -119,6 +122,7 @@ pub(crate) fn write(daemons: &[DaemonInfo]) -> std::io::Result<()> {
 }
 
 /// Unregister a daemon from the registry
+#[allow(dead_code)]
 pub(crate) fn unregister(id: u32) -> std::io::Result<()> {
     let _lock = FileLock::acquire()?;
     let mut daemons = read();
@@ -134,13 +138,14 @@ pub(crate) fn is_process_alive(pid: u32) -> bool {
     s.process(Pid::from_u32(pid)).is_some()
 }
 
-/// Kill a process by PID (cross-platform)
+/// Send graceful shutdown signal to a process by PID (cross-platform)
+/// Uses SIGINT, which triggers ctrl_c handler
 pub(crate) fn kill_process(pid: u32) -> bool {
     use sysinfo::{Pid, Signal, System};
 
     let s = System::new_all();
     s.process(Pid::from_u32(pid))
-        .map(|p| p.kill_with(Signal::Term).unwrap_or(false))
+        .map(|p| p.kill_with(Signal::Interrupt).unwrap_or(false))
         .unwrap_or(false)
 }
 

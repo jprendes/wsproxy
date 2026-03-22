@@ -140,14 +140,21 @@ enum DaemonAction {
     },
 
     /// List all running daemons
-    List,
+    List {
+        /// Output in JSON format for machine parsing
+        #[arg(long)]
+        json: bool,
+    },
 
-    /// Kill a daemon by ID
-    Kill {
-        /// The daemon ID to kill (from `daemon list`)
+    /// Gracefully shut down a daemon by ID
+    ///
+    /// Sends SIGINT to trigger graceful shutdown, allowing existing
+    /// connections to drain before the process exits.
+    Shutdown {
+        /// The daemon ID to shut down (from `daemon list`)
         id: u32,
 
-        /// Force immediate shutdown without draining connections
+        /// Force immediate shutdown (SIGKILL) without draining connections
         #[arg(short, long)]
         force: bool,
     },
@@ -165,6 +172,14 @@ enum DaemonAction {
         /// Path to the new wsproxy binary
         path: String,
     },
+}
+
+/// Wait for Ctrl+C (SIGINT) to trigger graceful shutdown.
+/// This works on both Unix and Windows.
+async fn wait_for_shutdown() {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("Failed to listen for Ctrl+C");
 }
 
 fn main() {
@@ -195,16 +210,12 @@ async fn run() -> wsproxy::Result<()> {
         } => {
             // Config file mode with hot-reload
             if let Some(config_path) = config {
-                if daemon::should_monitor_stdin() {
-                    wsproxy::server::run_with_config_until_shutdown(
-                        &config_path,
-                        daemon::wait_for_stdin_close(),
-                        std::time::Duration::from_secs(30),
-                    )
-                    .await?;
-                } else {
-                    wsproxy::server::run_with_config(&config_path).await?;
-                }
+                wsproxy::server::run_with_config_until_shutdown(
+                    &config_path,
+                    wait_for_shutdown(),
+                    std::time::Duration::from_secs(30),
+                )
+                .await?;
             } else {
                 // CLI mode
                 let listen = listen.expect("listen is required when not using config");
@@ -217,19 +228,15 @@ async fn run() -> wsproxy::Result<()> {
                     _ => wsproxy::server::TlsMode::None,
                 };
 
-                if daemon::should_monitor_stdin() {
-                    wsproxy::server::run_until_shutdown(
-                        &listen,
-                        &route,
-                        default_target.as_deref(),
-                        tls,
-                        daemon::wait_for_stdin_close(),
-                        std::time::Duration::from_secs(30),
-                    )
-                    .await?;
-                } else {
-                    wsproxy::server::run(&listen, &route, default_target.as_deref(), tls).await?;
-                }
+                wsproxy::server::run_until_shutdown(
+                    &listen,
+                    &route,
+                    default_target.as_deref(),
+                    tls,
+                    wait_for_shutdown(),
+                    std::time::Duration::from_secs(30),
+                )
+                .await?;
             }
         }
 
@@ -244,19 +251,14 @@ async fn run() -> wsproxy::Result<()> {
                 ca_cert_path: tls_ca_cert,
             };
 
-            // Check if we should monitor stdin for parent death (daemon mode)
-            if daemon::should_monitor_stdin() {
-                wsproxy::client::run_until_shutdown(
-                    &listen,
-                    &server,
-                    &tls_options,
-                    daemon::wait_for_stdin_close(),
-                    std::time::Duration::from_secs(30),
-                )
-                .await?;
-            } else {
-                wsproxy::client::run(&listen, &server, &tls_options).await?;
-            }
+            wsproxy::client::run_until_shutdown(
+                &listen,
+                &server,
+                &tls_options,
+                wait_for_shutdown(),
+                std::time::Duration::from_secs(30),
+            )
+            .await?;
         }
 
         Commands::Tunnel {
@@ -302,28 +304,38 @@ async fn run() -> wsproxy::Result<()> {
                 daemon::spawn_client(listen, server, insecure, tls_ca_cert)?;
             }
 
-            DaemonAction::List => {
+            DaemonAction::List { json } => {
                 let daemons = daemon::list()?;
-                if daemons.is_empty() {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&daemons)
+                            .map_err(|e| wsproxy::Error::config(e.to_string()))?
+                    );
+                } else if daemons.is_empty() {
                     println!("No daemons running");
                 } else {
-                    println!("{:<4} {:<8} ARGUMENTS", "ID", "PID");
-                    println!("{}", "-".repeat(50));
+                    println!("{:<4} {:<8} {:<6} ARGUMENTS", "ID", "PID", "PORT");
+                    println!("{}", "-".repeat(60));
                     for d in daemons {
-                        println!("{:<4} {:<8} {}", d.id, d.pid, d.args.join(" "));
+                        let port = d
+                            .port
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "-".to_string());
+                        println!("{:<4} {:<8} {:<6} {}", d.id, d.pid, port, d.args.join(" "));
                     }
                 }
             }
 
-            DaemonAction::Kill { id, force } => {
-                if daemon::kill(id, force)? {
+            DaemonAction::Shutdown { id, force } => {
+                if daemon::shutdown(id, force)? {
                     if force {
                         println!("Daemon {} force killed", id);
                     } else {
-                        println!("Daemon {} killed (draining connections)", id);
+                        println!("Daemon {} shutting down (draining connections)", id);
                     }
                 } else {
-                    eprintln!("Daemon {} not found or could not be killed", id);
+                    eprintln!("Daemon {} not found or could not be shut down", id);
                     std::process::exit(1);
                 }
             }

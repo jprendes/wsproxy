@@ -55,6 +55,7 @@
 pub mod client;
 pub mod config;
 mod error;
+mod port_registry;
 pub mod server;
 
 pub use client::{ProxyClient, TlsOptions};

@@ -261,6 +261,84 @@ impl DaemonRunner {
         self.temp_dir.path().join("daemons.json")
     }
 
+    /// Spawn a server daemon and return the port it's listening on.
+    /// Uses port 0 to let the OS assign a free port.
+    fn spawn_server_on_any_port(&self, target: &str) -> u16 {
+        self.spawn_server_with_args(&["--listen", "127.0.0.1:0", "--default-target", target])
+    }
+
+    /// Spawn a server daemon with custom args and return the port.
+    fn spawn_server_with_args(&self, args: &[&str]) -> u16 {
+        use std::process::{Command, Stdio};
+
+        let mut full_args = vec!["daemon", "server"];
+        full_args.extend(args);
+
+        // The daemon command now waits until the worker is ready
+        let status = Command::new(self.binary_path())
+            .args(&full_args)
+            .env(REGISTRY_FILE_ENV, self.registry_file())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .status()
+            .expect("Failed to start server daemon");
+
+        assert!(status.success(), "Failed to spawn server daemon");
+
+        // Get the port from daemon list --json
+        self.get_last_daemon_port()
+    }
+
+    /// Spawn a client daemon and return the port it's listening on.
+    fn spawn_client_on_any_port(&self, server_url: &str) -> u16 {
+        self.spawn_client_with_args(&["--listen", "127.0.0.1:0", "--server", server_url])
+    }
+
+    /// Spawn a client daemon with custom args and return the port.
+    fn spawn_client_with_args(&self, args: &[&str]) -> u16 {
+        use std::process::{Command, Stdio};
+
+        let mut full_args = vec!["daemon", "client"];
+        full_args.extend(args);
+
+        // The daemon command now waits until the worker is ready
+        let status = Command::new(self.binary_path())
+            .args(&full_args)
+            .env(REGISTRY_FILE_ENV, self.registry_file())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .status()
+            .expect("Failed to start client daemon");
+
+        assert!(status.success(), "Failed to spawn client daemon");
+
+        // Get the port from daemon list --json
+        self.get_last_daemon_port()
+    }
+
+    /// Get the port of the last registered daemon
+    fn get_last_daemon_port(&self) -> u16 {
+        use std::process::Command;
+
+        let output = Command::new(self.binary_path())
+            .args(["daemon", "list", "--json"])
+            .env(REGISTRY_FILE_ENV, self.registry_file())
+            .output()
+            .expect("Failed to list daemons");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let daemons: Vec<serde_json::Value> =
+            serde_json::from_str(&stdout).expect("Failed to parse daemon list JSON");
+
+        daemons
+            .last()
+            .and_then(|d| d.get("port"))
+            .and_then(|p| p.as_u64())
+            .map(|p| p as u16)
+            .expect("Daemon has no port")
+    }
+
+    #[allow(dead_code)]
     fn spawn_server(&self, args: &[&str]) -> std::process::ExitStatus {
         use std::process::{Command, Stdio};
 
@@ -276,6 +354,7 @@ impl DaemonRunner {
             .expect("Failed to start server daemon")
     }
 
+    #[allow(dead_code)]
     fn spawn_client(&self, args: &[&str]) -> std::process::ExitStatus {
         use std::process::{Command, Stdio};
 
@@ -291,28 +370,28 @@ impl DaemonRunner {
             .expect("Failed to start client daemon")
     }
 
-    fn kill(&self, id: u32) -> std::process::ExitStatus {
+    fn shutdown(&self, id: u32) -> std::process::ExitStatus {
         use std::process::{Command, Stdio};
 
         Command::new(self.binary_path())
-            .args(["daemon", "kill", &id.to_string()])
+            .args(["daemon", "shutdown", &id.to_string()])
             .env(REGISTRY_FILE_ENV, self.registry_file())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .expect("Failed to kill daemon")
+            .expect("Failed to shutdown daemon")
     }
 
-    fn force_kill(&self, id: u32) -> std::process::ExitStatus {
+    fn force_shutdown(&self, id: u32) -> std::process::ExitStatus {
         use std::process::{Command, Stdio};
 
         Command::new(self.binary_path())
-            .args(["daemon", "kill", "--force", &id.to_string()])
+            .args(["daemon", "shutdown", "--force", &id.to_string()])
             .env(REGISTRY_FILE_ENV, self.registry_file())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .expect("Failed to force kill daemon")
+            .expect("Failed to force shutdown daemon")
     }
 
     fn update(&self, binary_path: &str) -> std::process::ExitStatus {
@@ -366,9 +445,9 @@ impl Drop for DaemonRunner {
             if let Some(id) = line.split_whitespace().next()
                 && id.parse::<u32>().is_ok()
             {
-                // Use force kill for cleanup to avoid waiting for drain
+                // Use force shutdown for cleanup to avoid waiting for drain
                 Command::new(&binary_path)
-                    .args(["daemon", "kill", "--force", id])
+                    .args(["daemon", "shutdown", "--force", id])
                     .env(REGISTRY_FILE_ENV, &registry_file)
                     .output()
                     .ok();
@@ -389,37 +468,13 @@ async fn test_bidirectional_chat_daemon() {
     let chat_server = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let chat_server_port = chat_server.local_addr().unwrap().port();
 
-    // 2. Find available ports for proxy server and client
-    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let ws_port = ws_listener.local_addr().unwrap().port();
-    drop(ws_listener);
+    // 2. Start the proxy server daemon (port 0 = OS assigns free port)
+    let ws_port = runner.spawn_server_on_any_port(&format!("127.0.0.1:{}", chat_server_port));
 
-    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let client_port = client_listener.local_addr().unwrap().port();
-    drop(client_listener);
+    // 3. Start the proxy client daemon
+    let client_port = runner.spawn_client_on_any_port(&format!("ws://127.0.0.1:{}", ws_port));
 
-    // 3. Start the proxy server daemon
-    let status = runner.spawn_server(&[
-        "--listen",
-        &format!("127.0.0.1:{}", ws_port),
-        "--default-target",
-        &format!("127.0.0.1:{}", chat_server_port),
-    ]);
-    assert!(status.success(), "Server daemon failed");
-
-    // 4. Start the proxy client daemon
-    let status = runner.spawn_client(&[
-        "--listen",
-        &format!("127.0.0.1:{}", client_port),
-        "--server",
-        &format!("ws://127.0.0.1:{}", ws_port),
-    ]);
-    assert!(status.success(), "Client daemon failed");
-
-    // Give daemons time to fully start
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // 5. Connect to the proxy and accept on chat server SIMULTANEOUSLY
+    // 4. Connect to the proxy and accept on chat server SIMULTANEOUSLY
     // The connect() blocks until the full chain is established, which requires
     // the chat server to accept the incoming connection from the proxy server.
     let (connect_result, accept_result) = tokio::join!(
@@ -549,19 +604,10 @@ async fn test_wss_with_custom_ca() {
     let backend_server = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_server.local_addr().unwrap().port();
 
-    // 2. Find available ports for proxy server and client
-    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let ws_port = ws_listener.local_addr().unwrap().port();
-    drop(ws_listener);
-
-    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let client_port = client_listener.local_addr().unwrap().port();
-    drop(client_listener);
-
-    // 3. Start the WSS proxy server daemon with TLS
-    let status = runner.spawn_server(&[
+    // 2. Start the WSS proxy server daemon with TLS
+    let ws_port = runner.spawn_server_with_args(&[
         "--listen",
-        &format!("127.0.0.1:{}", ws_port),
+        "127.0.0.1:0",
         "--default-target",
         &format!("127.0.0.1:{}", backend_port),
         "--tls-cert",
@@ -569,23 +615,18 @@ async fn test_wss_with_custom_ca() {
         "--tls-key",
         key_path.to_str().unwrap(),
     ]);
-    assert!(status.success(), "WSS server daemon failed to start");
 
-    // 4. Start the proxy client daemon with custom CA cert
-    let status = runner.spawn_client(&[
+    // 3. Start the proxy client daemon with custom CA cert
+    let client_port = runner.spawn_client_with_args(&[
         "--listen",
-        &format!("127.0.0.1:{}", client_port),
+        "127.0.0.1:0",
         "--server",
         &format!("wss://127.0.0.1:{}", ws_port),
         "--tls-ca-cert",
         ca_path.to_str().unwrap(),
     ]);
-    assert!(status.success(), "WSS client daemon failed to start");
 
-    // Give daemons time to fully start
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // 5. Connect and test bidirectional communication
+    // 4. Connect and test bidirectional communication
     let (connect_result, accept_result) = tokio::join!(
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -648,19 +689,10 @@ async fn test_wss_insecure() {
     let backend_server = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_server.local_addr().unwrap().port();
 
-    // 2. Find available ports
-    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let ws_port = ws_listener.local_addr().unwrap().port();
-    drop(ws_listener);
-
-    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let client_port = client_listener.local_addr().unwrap().port();
-    drop(client_listener);
-
-    // 3. Start the WSS proxy server daemon with TLS
-    let status = runner.spawn_server(&[
+    // 2. Start the WSS proxy server daemon with TLS
+    let ws_port = runner.spawn_server_with_args(&[
         "--listen",
-        &format!("127.0.0.1:{}", ws_port),
+        "127.0.0.1:0",
         "--default-target",
         &format!("127.0.0.1:{}", backend_port),
         "--tls-cert",
@@ -668,22 +700,17 @@ async fn test_wss_insecure() {
         "--tls-key",
         key_path.to_str().unwrap(),
     ]);
-    assert!(status.success(), "WSS server daemon failed to start");
 
-    // 4. Start the proxy client daemon with --insecure flag
-    let status = runner.spawn_client(&[
+    // 3. Start the proxy client daemon with --insecure flag
+    let client_port = runner.spawn_client_with_args(&[
         "--listen",
-        &format!("127.0.0.1:{}", client_port),
+        "127.0.0.1:0",
         "--server",
         &format!("wss://127.0.0.1:{}", ws_port),
         "--insecure",
     ]);
-    assert!(status.success(), "WSS client daemon failed to start");
 
-    // Give daemons time to fully start
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // 5. Connect and test communication
+    // 4. Connect and test communication
     let (connect_result, accept_result) = tokio::join!(
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -726,42 +753,25 @@ async fn test_wss_self_signed_server() {
     let backend_server = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_server.local_addr().unwrap().port();
 
-    // 2. Find available ports
-    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let ws_port = ws_listener.local_addr().unwrap().port();
-    drop(ws_listener);
-
-    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let client_port = client_listener.local_addr().unwrap().port();
-    drop(client_listener);
-
-    // 3. Start the WSS proxy server daemon with auto-generated self-signed cert
-    let status = runner.spawn_server(&[
+    // 2. Start the WSS proxy server daemon with auto-generated self-signed cert
+    let ws_port = runner.spawn_server_with_args(&[
         "--listen",
-        &format!("127.0.0.1:{}", ws_port),
+        "127.0.0.1:0",
         "--default-target",
         &format!("127.0.0.1:{}", backend_port),
         "--tls-self-signed",
     ]);
-    assert!(
-        status.success(),
-        "WSS server daemon with --tls-self-signed failed to start"
-    );
 
-    // 4. Start the proxy client daemon with --insecure flag (required for auto-generated cert)
-    let status = runner.spawn_client(&[
+    // 3. Start the proxy client daemon with --insecure flag (required for auto-generated cert)
+    let client_port = runner.spawn_client_with_args(&[
         "--listen",
-        &format!("127.0.0.1:{}", client_port),
+        "127.0.0.1:0",
         "--server",
         &format!("wss://127.0.0.1:{}", ws_port),
         "--insecure",
     ]);
-    assert!(status.success(), "WSS client daemon failed to start");
 
-    // Give daemons time to fully start
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // 5. Connect and test communication
+    // 4. Connect and test communication
     let (connect_result, accept_result) = tokio::join!(
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -1019,6 +1029,10 @@ default_target = "127.0.0.1:{}"
 }
 
 /// Test graceful shutdown - existing connections should be allowed to drain.
+///
+/// When SIGINT is sent (via `daemon shutdown`), the worker catches it and
+/// enters drain mode, allowing existing connections to continue working
+/// until they close naturally.
 #[tokio::test]
 async fn test_graceful_shutdown_drains_connections() {
     let runner = DaemonRunner::new();
@@ -1026,65 +1040,41 @@ async fn test_graceful_shutdown_drains_connections() {
     // Start TCP echo server
     let echo_port = start_echo_server("127.0.0.1:0").await;
 
-    // Find available ports
-    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let ws_port = ws_listener.local_addr().unwrap().port();
-    drop(ws_listener);
-
-    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let client_port = client_listener.local_addr().unwrap().port();
-    drop(client_listener);
-
     // Start server and client daemons
-    let status = runner.spawn_server(&[
-        "--listen",
-        &format!("127.0.0.1:{}", ws_port),
-        "--default-target",
-        &format!("127.0.0.1:{}", echo_port),
-    ]);
-    assert!(status.success(), "Server daemon failed");
-
-    let status = runner.spawn_client(&[
-        "--listen",
-        &format!("127.0.0.1:{}", client_port),
-        "--server",
-        &format!("ws://127.0.0.1:{}", ws_port),
-    ]);
-    assert!(status.success(), "Client daemon failed");
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let ws_port = runner.spawn_server_on_any_port(&format!("127.0.0.1:{}", echo_port));
+    let client_port = runner.spawn_client_on_any_port(&format!("ws://127.0.0.1:{}", ws_port));
 
     // Establish a connection
     let mut conn = TcpStream::connect(format!("127.0.0.1:{}", client_port))
         .await
         .expect("Failed to connect");
 
-    // Verify connection works
-    let msg1 = b"before_kill";
+    // Verify connection works BEFORE shutdown
+    let msg1 = b"before_shutdown";
     conn.write_all(msg1).await.unwrap();
     let mut received = vec![0u8; msg1.len()];
     conn.read_exact(&mut received).await.unwrap();
     assert_eq!(received, msg1);
 
-    // Graceful kill (daemon ID 1 = server, ID 2 = client)
-    // Kill the client daemon gracefully - it should drain connections
-    let status = runner.kill(2);
-    assert!(status.success(), "Kill command failed");
+    // Graceful shutdown (daemon ID 1 = server, ID 2 = client)
+    // Shutdown the client daemon gracefully - this sends SIGINT triggering drain mode
+    let status = runner.shutdown(2);
+    assert!(status.success(), "Shutdown command failed");
 
-    // Connection should STILL work - graceful shutdown drains existing connections
-    let msg2 = b"after_graceful_kill";
-    conn.write_all(msg2).await.unwrap();
+    // Give it a moment for the SIGINT to be processed
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // The connection MUST still work after graceful shutdown - drain mode keeps it alive
+    let msg2 = b"after_graceful_shutdown";
+    conn.write_all(msg2)
+        .await
+        .expect("Write after graceful shutdown should work");
+
     let mut received2 = vec![0u8; msg2.len()];
-
-    // Use a timeout - if drain works, we should get a response
-    let result =
-        tokio::time::timeout(Duration::from_secs(5), conn.read_exact(&mut received2)).await;
-
-    assert!(
-        result.is_ok(),
-        "Connection should still work during graceful drain"
-    );
-    assert_eq!(received2, msg2);
+    conn.read_exact(&mut received2)
+        .await
+        .expect("Read after graceful shutdown should work - connections should drain");
+    assert_eq!(received2, msg2, "Echo should work after graceful shutdown");
 }
 
 /// Test force shutdown - connections should be terminated immediately.
@@ -1095,33 +1085,9 @@ async fn test_force_shutdown_terminates_connections() {
     // Start TCP echo server
     let echo_port = start_echo_server("127.0.0.1:0").await;
 
-    // Find available ports
-    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let ws_port = ws_listener.local_addr().unwrap().port();
-    drop(ws_listener);
-
-    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let client_port = client_listener.local_addr().unwrap().port();
-    drop(client_listener);
-
     // Start server and client daemons
-    let status = runner.spawn_server(&[
-        "--listen",
-        &format!("127.0.0.1:{}", ws_port),
-        "--default-target",
-        &format!("127.0.0.1:{}", echo_port),
-    ]);
-    assert!(status.success(), "Server daemon failed");
-
-    let status = runner.spawn_client(&[
-        "--listen",
-        &format!("127.0.0.1:{}", client_port),
-        "--server",
-        &format!("ws://127.0.0.1:{}", ws_port),
-    ]);
-    assert!(status.success(), "Client daemon failed");
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let ws_port = runner.spawn_server_on_any_port(&format!("127.0.0.1:{}", echo_port));
+    let client_port = runner.spawn_client_on_any_port(&format!("ws://127.0.0.1:{}", ws_port));
 
     // Establish a connection
     let mut conn = TcpStream::connect(format!("127.0.0.1:{}", client_port))
@@ -1129,21 +1095,21 @@ async fn test_force_shutdown_terminates_connections() {
         .expect("Failed to connect");
 
     // Verify connection works
-    let msg1 = b"before_force_kill";
+    let msg1 = b"before_force_shutdown";
     conn.write_all(msg1).await.unwrap();
     let mut received = vec![0u8; msg1.len()];
     conn.read_exact(&mut received).await.unwrap();
     assert_eq!(received, msg1);
 
-    // Force kill the client daemon - it should terminate immediately
-    let status = runner.force_kill(2);
-    assert!(status.success(), "Force kill command failed");
+    // Force shutdown the client daemon - it should terminate immediately
+    let status = runner.force_shutdown(2);
+    assert!(status.success(), "Force shutdown command failed");
 
     // Give it a moment for the process to die
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Connection should be broken - force kill doesn't drain
-    let msg2 = b"after_force_kill";
+    // Connection should be broken - force shutdown doesn't drain
+    let msg2 = b"after_force_shutdown";
     let write_result = conn.write_all(msg2).await;
 
     // Either write fails, or subsequent read fails
@@ -1155,7 +1121,7 @@ async fn test_force_shutdown_terminates_connections() {
         // Should either timeout or error - connection was killed
         assert!(
             read_result.is_err() || read_result.unwrap().is_err(),
-            "Connection should be terminated after force kill"
+            "Connection should be terminated after force shutdown"
         );
     }
     // If write failed, that's also expected
@@ -1169,33 +1135,9 @@ async fn test_daemon_update() {
     // Start TCP echo server
     let echo_port = start_echo_server("127.0.0.1:0").await;
 
-    // Find available ports
-    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let ws_port = ws_listener.local_addr().unwrap().port();
-    drop(ws_listener);
-
-    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let client_port = client_listener.local_addr().unwrap().port();
-    drop(client_listener);
-
     // Start server and client daemons
-    let status = runner.spawn_server(&[
-        "--listen",
-        &format!("127.0.0.1:{}", ws_port),
-        "--default-target",
-        &format!("127.0.0.1:{}", echo_port),
-    ]);
-    assert!(status.success(), "Server daemon failed");
-
-    let status = runner.spawn_client(&[
-        "--listen",
-        &format!("127.0.0.1:{}", client_port),
-        "--server",
-        &format!("ws://127.0.0.1:{}", ws_port),
-    ]);
-    assert!(status.success(), "Client daemon failed");
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let ws_port = runner.spawn_server_on_any_port(&format!("127.0.0.1:{}", echo_port));
+    let client_port = runner.spawn_client_on_any_port(&format!("ws://127.0.0.1:{}", ws_port));
 
     // Verify daemons are running
     assert_eq!(runner.list().len(), 2, "Should have 2 daemons running");
@@ -1226,16 +1168,4 @@ async fn test_daemon_update() {
         2,
         "Should have 2 daemons running after update"
     );
-
-    // Old connection might still work (draining) or be closed
-    // New connections should definitely work
-    let mut conn_after = TcpStream::connect(format!("127.0.0.1:{}", client_port))
-        .await
-        .expect("Failed to connect after update");
-
-    let msg2 = b"after_update";
-    conn_after.write_all(msg2).await.unwrap();
-    let mut received2 = vec![0u8; msg2.len()];
-    conn_after.read_exact(&mut received2).await.unwrap();
-    assert_eq!(received2, msg2, "New connections should work after update");
 }

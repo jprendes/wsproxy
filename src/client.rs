@@ -43,12 +43,6 @@ pub struct TlsOptions {
 /// ```
 pub async fn run(listen: &str, server_url: &str, tls_options: &TlsOptions) -> Result<()> {
     let client = ProxyClient::bind(listen, server_url, tls_options.clone())?;
-
-    eprintln!(
-        "Proxy client listening on {}, forwarding to {}",
-        listen, server_url
-    );
-
     client.run().await
 }
 
@@ -68,12 +62,6 @@ where
     F: std::future::Future<Output = ()>,
 {
     let client = ProxyClient::bind(listen, server_url, tls_options.clone())?;
-
-    eprintln!(
-        "Proxy client listening on {}, forwarding to {}",
-        listen, server_url
-    );
-
     client.run_until_shutdown(shutdown, drain_timeout).await
 }
 
@@ -231,6 +219,14 @@ impl ProxyClient {
             Bindable::Listener(l) => l,
         };
 
+        // Print actual bound address (important when binding to port 0)
+        let local_addr = listener.local_addr()?;
+        eprintln!(
+            "Proxy client listening on {}, forwarding to {}",
+            local_addr, self.inner.server_url
+        );
+        crate::port_registry::report_port(local_addr.port());
+
         loop {
             let (stream, peer_addr) = listener.accept().await?;
             let server_url = self.inner.server_url.clone();
@@ -265,6 +261,14 @@ impl ProxyClient {
             Bindable::Address(addr) => TcpListener::bind(addr).await?,
             Bindable::Listener(l) => l,
         };
+
+        // Print actual bound address (important when binding to port 0)
+        let local_addr = listener.local_addr()?;
+        eprintln!(
+            "Proxy client listening on {}, forwarding to {}",
+            local_addr, self.inner.server_url
+        );
+        crate::port_registry::report_port(local_addr.port());
 
         // Track active connections
         let active_connections = Arc::new(AtomicUsize::new(0));

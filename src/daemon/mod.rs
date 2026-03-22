@@ -2,7 +2,8 @@
 //!
 //! Supports running both server and client as daemons with:
 //! - Automatic restart on failure with exponential backoff
-//! - Cross-platform daemon registry for listing and killing daemons
+//! - Cross-platform daemon registry for listing and shutting down daemons
+//! - Graceful shutdown via SIGINT (Ctrl+C) allowing connections to drain
 
 mod registry;
 
@@ -14,10 +15,7 @@ pub use registry::{DaemonInfo, DaemonRole};
 /// Environment variable used to indicate we're running as the daemon subprocess
 const DAEMON_ENV_VAR: &str = "__WSPROXY_DAEMON_CHILD";
 
-/// Environment variable to indicate the process should monitor stdin for parent death
-const MONITOR_STDIN_VAR: &str = "__WSPROXY_MONITOR_STDIN";
-
-/// Environment variable containing the daemon ID
+/// Environment variable containing the daemon ID (also passed to workers for port reporting)
 const DAEMON_ID_VAR: &str = "__WSPROXY_DAEMON_ID";
 
 /// Check if this process is running as the daemon child (restart loop)
@@ -25,12 +23,8 @@ pub fn is_daemon_child() -> bool {
     std::env::var(DAEMON_ENV_VAR).is_ok()
 }
 
-/// Check if the process should monitor stdin for parent death
-pub fn should_monitor_stdin() -> bool {
-    std::env::var(MONITOR_STDIN_VAR).is_ok()
-}
-
-/// Get the daemon ID from environment (for cleanup on exit)
+/// Get the daemon ID from environment (used for registry operations)
+#[allow(dead_code)]
 fn get_daemon_id() -> Option<u32> {
     std::env::var(DAEMON_ID_VAR).ok()?.parse().ok()
 }
@@ -66,31 +60,18 @@ pub fn run_restart_loop() -> ! {
         "server"
     };
 
-    // Set up cleanup on exit
-    let daemon_id = get_daemon_id();
-    ctrlc::set_handler(move || {
-        if let Some(id) = daemon_id {
-            registry::unregister(id).ok();
-        }
-        std::process::exit(0);
-    })
-    .ok();
-
     let mut backoff_ms = MIN_BACKOFF_MS;
 
     loop {
         eprintln!("Starting wsproxy {}...", role);
 
-        // Use piped stdin - when this process dies, stdin closes,
-        // and the child will detect EOF
-        let mut child = match Command::new(&child_args[0])
-            .args(&child_args[1..])
+        // Worker catches SIGINT (Ctrl+C) directly (same process group) for graceful shutdown
+        let mut cmd = Command::new(&child_args[0]);
+        cmd.args(&child_args[1..])
             .env_remove(DAEMON_ENV_VAR)
-            .env_remove(DAEMON_ID_VAR)
-            .env(MONITOR_STDIN_VAR, "1")
-            .stdin(Stdio::piped())
-            .spawn()
-        {
+            .stdin(Stdio::null());
+
+        let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
                 eprintln!("Failed to start wsproxy {}: {}", role, e);
@@ -100,10 +81,6 @@ pub fn run_restart_loop() -> ! {
                 continue;
             }
         };
-
-        // Take stdin handle - holding it keeps the pipe open
-        // When this daemon dies, the handle is dropped and stdin closes
-        let _stdin_handle = child.stdin.take();
 
         let status = child.wait();
 
@@ -207,6 +184,8 @@ pub fn spawn_client(
 
 /// Spawn a detached daemon process
 fn spawn_daemon(role: DaemonRole, args: Vec<String>) -> wsproxy::Result<()> {
+    use std::io::{BufRead, BufReader};
+
     let exe = std::env::current_exe()
         .map_err(|e| wsproxy::Error::config(format!("Failed to get current executable: {}", e)))?;
 
@@ -219,6 +198,7 @@ fn spawn_daemon(role: DaemonRole, args: Vec<String>) -> wsproxy::Result<()> {
     };
 
     // Spawn the daemon with its ID already set
+    // Use piped stderr so we can wait for the worker to be ready
     let mut cmd = Command::new(&exe);
     cmd.arg("daemon");
     cmd.args(&args);
@@ -226,9 +206,9 @@ fn spawn_daemon(role: DaemonRole, args: Vec<String>) -> wsproxy::Result<()> {
     cmd.env(DAEMON_ID_VAR, id.to_string());
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::inherit());
+    cmd.stderr(Stdio::piped());
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| wsproxy::Error::config(format!("Failed to spawn daemon process: {}", e)))?;
 
@@ -251,6 +231,7 @@ fn spawn_daemon(role: DaemonRole, args: Vec<String>) -> wsproxy::Result<()> {
             role,
             args: args.clone(),
             started_at,
+            port: None,
         });
 
         registry::write(&daemons)
@@ -258,6 +239,36 @@ fn spawn_daemon(role: DaemonRole, args: Vec<String>) -> wsproxy::Result<()> {
     }
 
     eprintln!("Daemon started with ID {} (PID {})", id, pid);
+
+    // Wait for the worker to print its listening address, forwarding all stderr
+    // This ensures the daemon is ready before we return
+    let stderr = child.stderr.take().expect("Failed to get stderr");
+    let reader = BufReader::new(stderr);
+
+    // Read stderr until we see the "listening on" message, then spawn a thread for the rest
+    let mut lines = reader.lines();
+    let mut found_listening = false;
+
+    while let Some(Ok(line)) = lines.next() {
+        eprintln!("{}", line);
+        if line.contains("listening on") {
+            found_listening = true;
+            break;
+        }
+    }
+
+    if !found_listening {
+        return Err(wsproxy::Error::config(
+            "Daemon worker failed to start (no listening message)".to_string(),
+        ));
+    }
+
+    // Continue forwarding stderr in a background thread
+    std::thread::spawn(move || {
+        for line in lines.map_while(Result::ok) {
+            eprintln!("{}", line);
+        }
+    });
 
     Ok(())
 }
@@ -281,14 +292,16 @@ pub fn list() -> wsproxy::Result<Vec<DaemonInfo>> {
     Ok(alive)
 }
 
-/// Kill a daemon by ID
+/// Shut down a daemon by ID.
 ///
-/// If `force` is false, sends SIGTERM to the restart loop, which causes
-/// the worker to drain connections gracefully before exiting.
+/// By default (force=false), sends SIGINT which triggers graceful shutdown:
+/// - The worker catches SIGINT and stops accepting new connections
+/// - Existing connections are allowed to drain (continue until they close naturally)
+/// - The process exits once all connections are closed
 ///
-/// If `force` is true, sends SIGKILL to both the restart loop and worker
-/// processes, immediately terminating all connections.
-pub fn kill(id: u32, force: bool) -> wsproxy::Result<bool> {
+/// If `force` is true, sends SIGKILL to immediately terminate the daemon
+/// and all its worker processes, dropping any active connections.
+pub fn shutdown(id: u32, force: bool) -> wsproxy::Result<bool> {
     let _lock = registry::FileLock::acquire()
         .map_err(|e| wsproxy::Error::config(format!("Failed to acquire lock: {}", e)))?;
 
@@ -314,23 +327,11 @@ pub fn kill(id: u32, force: bool) -> wsproxy::Result<bool> {
     }
 }
 
-/// Wait for stdin to close (indicating parent daemon died).
-/// Returns when EOF is detected on stdin.
-pub async fn wait_for_stdin_close() {
-    use tokio::io::AsyncReadExt;
-
-    let mut stdin = tokio::io::stdin();
-    let mut buf = [0u8; 1];
-
-    // This returns Ok(0) when stdin is closed (EOF)
-    let _ = stdin.read(&mut buf).await;
-}
-
 /// Update the wsproxy binary and restart all daemons.
 ///
 /// This function:
 /// 1. Reads all running daemon info
-/// 2. Stops each daemon's restart loop (workers continue serving)
+/// 2. Sends SIGINT to trigger graceful shutdown (workers drain connections)
 /// 3. Replaces the current binary with the new one
 /// 4. Spawns new daemons with the same arguments
 ///
@@ -368,8 +369,7 @@ pub fn update(new_binary_path: &str) -> wsproxy::Result<()> {
             daemons.len()
         );
 
-        // Stop all daemon restart loops (sending SIGTERM)
-        // This will cause stdin to close for workers, triggering graceful drain
+        // Send SIGINT to trigger graceful shutdown with connection draining
         for daemon in &daemons {
             registry::kill_process(daemon.pid);
         }

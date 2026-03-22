@@ -264,7 +264,6 @@ pub async fn run(
     }
 
     // Set TLS config if provided
-    let is_tls = !matches!(tls, TlsMode::None);
     match tls {
         TlsMode::None => {}
         TlsMode::Files { cert, key } => {
@@ -276,13 +275,6 @@ pub async fn run(
     }
 
     let server = builder.bind(listen)?;
-
-    if is_tls {
-        eprintln!("Proxy server listening on {} (WSS)", listen);
-    } else {
-        eprintln!("Proxy server listening on {}", listen);
-    }
-
     server.run().await
 }
 
@@ -318,7 +310,6 @@ where
         builder = builder.default_target(target.to_string());
     }
 
-    let is_tls = !matches!(tls, TlsMode::None);
     match tls {
         TlsMode::None => {}
         TlsMode::Files { cert, key } => {
@@ -330,13 +321,6 @@ where
     }
 
     let server = builder.bind(listen)?;
-
-    if is_tls {
-        eprintln!("Proxy server listening on {} (WSS)", listen);
-    } else {
-        eprintln!("Proxy server listening on {}", listen);
-    }
-
     server.run_until_shutdown(shutdown, drain_timeout).await
 }
 
@@ -948,6 +932,15 @@ impl ProxyServer {
             Bindable::Listener(l) => l,
         };
 
+        // Print actual bound address (important when binding to port 0)
+        let local_addr = listener.local_addr()?;
+        if self.inner.tls_acceptor.is_some() {
+            eprintln!("Proxy server listening on {} (WSS)", local_addr);
+        } else {
+            eprintln!("Proxy server listening on {}", local_addr);
+        }
+        crate::port_registry::report_port(local_addr.port());
+
         loop {
             let (stream, peer_addr) = listener.accept().await?;
             let inner = Arc::clone(&self.inner);
@@ -995,6 +988,15 @@ impl ProxyServer {
             Bindable::Address(addr) => TcpListener::bind(addr).await?,
             Bindable::Listener(l) => l,
         };
+
+        // Print actual bound address (important when binding to port 0)
+        let local_addr = listener.local_addr()?;
+        if self.inner.tls_acceptor.is_some() {
+            eprintln!("Proxy server listening on {} (WSS)", local_addr);
+        } else {
+            eprintln!("Proxy server listening on {}", local_addr);
+        }
+        crate::port_registry::report_port(local_addr.port());
 
         // Track active connections
         let active_connections = Arc::new(AtomicUsize::new(0));
