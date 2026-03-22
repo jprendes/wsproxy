@@ -229,18 +229,36 @@ const WSPROXY_BIN: &str = env!("CARGO_BIN_EXE_wsproxy");
 
 /// RAII guard that cleans up daemons on drop
 struct DaemonRunner {
-    registry_dir: tempfile::TempDir,
+    temp_dir: tempfile::TempDir,
 }
 
 impl DaemonRunner {
     fn new() -> Self {
-        Self {
-            registry_dir: tempfile::tempdir().unwrap(),
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Copy the binary to the temp directory so we can test updates
+        // without modifying the actual test binary
+        let binary_path = temp_dir.path().join("wsproxy");
+        std::fs::copy(WSPROXY_BIN, &binary_path).expect("Failed to copy binary");
+
+        // Set executable permissions on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&binary_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&binary_path, perms).unwrap();
         }
+
+        Self { temp_dir }
+    }
+
+    fn binary_path(&self) -> std::path::PathBuf {
+        self.temp_dir.path().join("wsproxy")
     }
 
     fn registry_file(&self) -> std::path::PathBuf {
-        self.registry_dir.path().join("daemons.json")
+        self.temp_dir.path().join("daemons.json")
     }
 
     fn spawn_server(&self, args: &[&str]) -> std::process::ExitStatus {
@@ -249,7 +267,7 @@ impl DaemonRunner {
         let mut full_args = vec!["daemon", "server"];
         full_args.extend(args);
 
-        Command::new(WSPROXY_BIN)
+        Command::new(self.binary_path())
             .args(&full_args)
             .env(REGISTRY_FILE_ENV, self.registry_file())
             .stdout(Stdio::null())
@@ -264,7 +282,7 @@ impl DaemonRunner {
         let mut full_args = vec!["daemon", "client"];
         full_args.extend(args);
 
-        Command::new(WSPROXY_BIN)
+        Command::new(self.binary_path())
             .args(&full_args)
             .env(REGISTRY_FILE_ENV, self.registry_file())
             .stdout(Stdio::null())
@@ -276,7 +294,7 @@ impl DaemonRunner {
     fn kill(&self, id: u32) -> std::process::ExitStatus {
         use std::process::{Command, Stdio};
 
-        Command::new(WSPROXY_BIN)
+        Command::new(self.binary_path())
             .args(["daemon", "kill", &id.to_string()])
             .env(REGISTRY_FILE_ENV, self.registry_file())
             .stdout(Stdio::null())
@@ -288,7 +306,7 @@ impl DaemonRunner {
     fn force_kill(&self, id: u32) -> std::process::ExitStatus {
         use std::process::{Command, Stdio};
 
-        Command::new(WSPROXY_BIN)
+        Command::new(self.binary_path())
             .args(["daemon", "kill", "--force", &id.to_string()])
             .env(REGISTRY_FILE_ENV, self.registry_file())
             .stdout(Stdio::null())
@@ -300,7 +318,7 @@ impl DaemonRunner {
     fn update(&self, binary_path: &str) -> std::process::ExitStatus {
         use std::process::{Command, Stdio};
 
-        Command::new(WSPROXY_BIN)
+        Command::new(self.binary_path())
             .args(["daemon", "update", binary_path])
             .env(REGISTRY_FILE_ENV, self.registry_file())
             .stdout(Stdio::null())
@@ -312,7 +330,7 @@ impl DaemonRunner {
     fn list(&self) -> Vec<u32> {
         use std::process::Command;
 
-        let output = Command::new(WSPROXY_BIN)
+        let output = Command::new(self.binary_path())
             .args(["daemon", "list"])
             .env(REGISTRY_FILE_ENV, self.registry_file())
             .output()
@@ -335,8 +353,9 @@ impl Drop for DaemonRunner {
     fn drop(&mut self) {
         use std::process::Command;
 
+        let binary_path = self.binary_path();
         let registry_file = self.registry_file();
-        let output = Command::new(WSPROXY_BIN)
+        let output = Command::new(&binary_path)
             .args(["daemon", "list"])
             .env(REGISTRY_FILE_ENV, &registry_file)
             .output()
@@ -348,7 +367,7 @@ impl Drop for DaemonRunner {
                 && id.parse::<u32>().is_ok()
             {
                 // Use force kill for cleanup to avoid waiting for drain
-                Command::new(WSPROXY_BIN)
+                Command::new(&binary_path)
                     .args(["daemon", "kill", "--force", id])
                     .env(REGISTRY_FILE_ENV, &registry_file)
                     .output()
@@ -508,7 +527,7 @@ async fn test_wss_with_custom_ca() {
     let (ca_pem, cert_pem, key_pem) = generate_test_certs();
 
     // Write certificates to temp files
-    let cert_dir = runner.registry_dir.path();
+    let cert_dir = runner.temp_dir.path();
     let ca_path = cert_dir.join("ca.pem");
     let cert_path = cert_dir.join("server.crt");
     let key_path = cert_dir.join("server.key");
@@ -612,7 +631,7 @@ async fn test_wss_insecure() {
     let (_, cert_pem, key_pem) = generate_test_certs();
 
     // Write certificates to temp files
-    let cert_dir = runner.registry_dir.path();
+    let cert_dir = runner.temp_dir.path();
     let cert_path = cert_dir.join("server.crt");
     let key_path = cert_dir.join("server.key");
 
@@ -1147,11 +1166,6 @@ async fn test_force_shutdown_terminates_connections() {
 async fn test_daemon_update() {
     let runner = DaemonRunner::new();
 
-    // Copy the binary to a temp file to simulate updating with a different file
-    let temp_dir = tempfile::tempdir().unwrap();
-    let new_binary_path = temp_dir.path().join("wsproxy_new");
-    std::fs::copy(WSPROXY_BIN, &new_binary_path).expect("Failed to copy binary");
-
     // Start TCP echo server
     let echo_port = start_echo_server("127.0.0.1:0").await;
 
@@ -1197,8 +1211,9 @@ async fn test_daemon_update() {
     conn_before.read_exact(&mut received).await.unwrap();
     assert_eq!(received, msg1);
 
-    // Run update with the copied binary
-    let status = runner.update(new_binary_path.to_str().unwrap());
+    // Run update using the original binary (DaemonRunner uses a copy,
+    // so WSPROXY_BIN is a different file we can update to)
+    let status = runner.update(WSPROXY_BIN);
     assert!(status.success(), "Update command failed");
 
     // Give time for old daemons to drain and new ones to start
