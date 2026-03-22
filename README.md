@@ -45,6 +45,14 @@ wsproxy server --listen 0.0.0.0:8443 \
   --tls-key key.pem
 ```
 
+**Server with auto-generated self-signed certificate:**
+
+```bash
+wsproxy server --listen 0.0.0.0:8443 \
+  --default-target 127.0.0.1:22 \
+  --tls-self-signed
+```
+
 **Client:**
 
 ```bash
@@ -55,6 +63,19 @@ wsproxy client --listen 127.0.0.1:2222 --server ws://proxy-server:8080/ssh
 
 ```bash
 wsproxy client --listen 127.0.0.1:2222 --server wss://proxy-server:8443/ssh
+```
+
+**Client with self-signed certificate (insecure mode):**
+
+```bash
+wsproxy client --listen 127.0.0.1:2222 --server wss://proxy-server:8443/ssh --insecure
+```
+
+**Client with custom CA certificate:**
+
+```bash
+wsproxy client --listen 127.0.0.1:2222 --server wss://proxy-server:8443/ssh \
+  --tls-ca-cert /path/to/ca.pem
 ```
 
 ### Daemon Mode
@@ -102,10 +123,51 @@ wsproxy daemon kill 1
 
 Daemons automatically restart with exponential backoff (1ms to 5 minutes) if the underlying process crashes.
 
+### Configuration File
+
+Instead of command-line arguments, you can use a TOML configuration file with **hot-reload support**. When the config file changes, the server automatically picks up the new configuration without dropping active connections.
+
+**Start server with config file:**
+
+```bash
+wsproxy server --config server.toml
+```
+
+**Example configuration file (`server.toml`):**
+
+```toml
+listen = "0.0.0.0:8080"
+default_target = "127.0.0.1:22"
+
+[routes]
+"/ssh" = "127.0.0.1:22"
+"/db" = "127.0.0.1:5432"
+"/redis" = "127.0.0.1:6379"
+
+[tls]
+cert = "cert.pem"
+key = "key.pem"
+# Or use: self_signed = true
+```
+
+**Hot-reload behavior:**
+
+- **Routes and default_target changes**: Applied instantly. Existing connections continue uninterrupted; new connections use the updated routing.
+- **Listen address or TLS changes**: Server automatically restarts. Existing connections continue until they complete naturally.
+- **Invalid configuration**: If the config file has syntax errors or invalid values, the error is logged and the server continues running with the previous valid configuration. Existing connections are not affected.
+
+**Daemon mode with config:**
+
+```bash
+wsproxy daemon server --config server.toml
+```
+
+Note: The `--config` flag cannot be combined with other server options (`--listen`, `--route`, `--default-target`, `--tls-*`).
+
 ### Library
 
 ```rust
-use wsproxy::{ProxyServer, ProxyClient};
+use wsproxy::{ProxyServer, ProxyClient, TlsOptions};
 
 #[tokio::main]
 async fn main() -> wsproxy::Result<()> {
@@ -121,11 +183,31 @@ async fn main() -> wsproxy::Result<()> {
         .tls("cert.pem", "key.pem")
         .bind("0.0.0.0:8443")?;
 
+    // Server with auto-generated self-signed certificate
+    let dev_server = ProxyServer::builder()
+        .default_target("127.0.0.1:22")?
+        .tls_self_signed()
+        .bind("0.0.0.0:8443")?;
+
     // Client (supports both ws:// and wss://)
     let client = ProxyClient::bind(
         "127.0.0.1:2222",
         "wss://proxy-server:8443/ssh",
+        TlsOptions::default(),
     )?;
+
+    // Client with custom CA certificate (for self-signed servers)
+    let client_custom_ca = ProxyClient::bind(
+        "127.0.0.1:2222",
+        "wss://proxy-server:8443/ssh",
+        TlsOptions {
+            insecure: false,
+            ca_cert_path: Some("/path/to/ca.pem".to_string()),
+        },
+    )?;
+
+    // Run server with config file (supports hot-reload)
+    // wsproxy::server::run_with_config("server.toml").await?;
 
     // Run (typically in separate processes)
     // server.run().await?;

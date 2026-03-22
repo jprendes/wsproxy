@@ -131,37 +131,48 @@ pub fn run_restart_loop() -> ! {
 
 /// Spawn a detached daemon process for server
 pub fn spawn_server(
-    listen: String,
+    config: Option<String>,
+    listen: Option<String>,
     route: Vec<String>,
     default_target: Option<String>,
     tls_cert: Option<String>,
     tls_key: Option<String>,
     tls_self_signed: bool,
 ) -> wsproxy::Result<()> {
-    let mut args = vec!["server".to_string(), "--listen".to_string(), listen];
+    let mut args = vec!["server".to_string()];
 
-    for r in &route {
-        args.push("--route".to_string());
-        args.push(r.clone());
-    }
+    if let Some(config_path) = &config {
+        args.push("--config".to_string());
+        args.push(config_path.clone());
+    } else {
+        if let Some(listen_addr) = &listen {
+            args.push("--listen".to_string());
+            args.push(listen_addr.clone());
+        }
 
-    if let Some(target) = &default_target {
-        args.push("--default-target".to_string());
-        args.push(target.clone());
-    }
+        for r in &route {
+            args.push("--route".to_string());
+            args.push(r.clone());
+        }
 
-    if let Some(cert) = &tls_cert {
-        args.push("--tls-cert".to_string());
-        args.push(cert.clone());
-    }
+        if let Some(target) = &default_target {
+            args.push("--default-target".to_string());
+            args.push(target.clone());
+        }
 
-    if let Some(key) = &tls_key {
-        args.push("--tls-key".to_string());
-        args.push(key.clone());
-    }
+        if let Some(cert) = &tls_cert {
+            args.push("--tls-cert".to_string());
+            args.push(cert.clone());
+        }
 
-    if tls_self_signed {
-        args.push("--tls-self-signed".to_string());
+        if let Some(key) = &tls_key {
+            args.push("--tls-key".to_string());
+            args.push(key.clone());
+        }
+
+        if tls_self_signed {
+            args.push("--tls-self-signed".to_string());
+        }
     }
 
     spawn_daemon(DaemonRole::Server, args)

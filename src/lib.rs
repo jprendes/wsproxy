@@ -53,9 +53,11 @@
 //! ```
 
 pub mod client;
+pub mod config;
 mod error;
 pub mod server;
 
 pub use client::{ProxyClient, TlsOptions};
+pub use config::{ConfigChange, ConfigWatcher, ServerFileConfig};
 pub use error::{Error, Result};
 pub use server::{ProxyServer, ProxyServerBuilder, TlsMode};

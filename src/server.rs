@@ -4,15 +4,18 @@
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::Path;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::RwLock;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::config::{ConfigChange, ConfigWatcher, ResolvedConfig, ServerFileConfig};
 use crate::error::{Error, Result};
 
 /// TLS configuration for the server
@@ -111,6 +114,165 @@ pub async fn run(
     }
 
     server.run().await
+}
+
+/// Run a proxy server with configuration loaded from a file.
+///
+/// This function watches the config file for changes and hot-reloads
+/// routing configuration. If the listen address or TLS settings change,
+/// the server will restart (existing connections continue until complete).
+///
+/// # Arguments
+///
+/// * `config_path` - Path to the TOML configuration file
+///
+/// # Example Configuration
+///
+/// ```toml
+/// listen = "0.0.0.0:8080"
+/// default_target = "127.0.0.1:22"
+///
+/// [routes]
+/// "/ssh" = "127.0.0.1:22"
+/// "/db" = "127.0.0.1:5432"
+///
+/// [tls]
+/// cert = "cert.pem"
+/// key = "key.pem"
+/// ```
+pub async fn run_with_config(config_path: impl AsRef<Path>) -> Result<()> {
+    let config_path = config_path.as_ref();
+
+    loop {
+        // Load initial config
+        let config = ServerFileConfig::load(config_path)?;
+        let resolved = ResolvedConfig::from_file_config(&config)?;
+
+        // Build the server
+        let tls_acceptor = build_tls_acceptor(&config)?;
+
+        let is_tls = config.has_tls();
+        if is_tls {
+            eprintln!(
+                "Proxy server listening on {} (WSS) - config: {}",
+                config.listen,
+                config_path.display()
+            );
+        } else {
+            eprintln!(
+                "Proxy server listening on {} - config: {}",
+                config.listen,
+                config_path.display()
+            );
+        }
+
+        // Create shared routing config for hot-reload
+        let shared_config = Arc::new(RwLock::new(resolved));
+
+        // Set up config file watcher
+        let mut watcher = ConfigWatcher::new(config_path, config.clone())?;
+
+        // Bind the listener
+        let listener = TcpListener::bind(&config.listen).await?;
+
+        // Run the server with hot-reload support
+        let restart_needed = run_server_loop(listener, tls_acceptor, shared_config, &mut watcher).await?;
+
+        if !restart_needed {
+            break;
+        }
+
+        eprintln!("Configuration changed, restarting server...");
+    }
+
+    Ok(())
+}
+
+fn build_tls_acceptor(config: &ServerFileConfig) -> Result<Option<tokio_rustls::TlsAcceptor>> {
+    if !config.has_tls() {
+        return Ok(None);
+    }
+
+    let (certs, key) = if config.tls.self_signed {
+        generate_self_signed_cert()?
+    } else if let (Some(cert), Some(key)) = (&config.tls.cert, &config.tls.key) {
+        load_certs_from_files(cert, key)?
+    } else {
+        return Err(Error::config("invalid TLS configuration"));
+    };
+
+    let tls_config = tokio_rustls::rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| Error::config(format!("failed to create TLS config: {}", e)))?;
+
+    Ok(Some(tokio_rustls::TlsAcceptor::from(Arc::new(tls_config))))
+}
+
+async fn run_server_loop(
+    listener: TcpListener,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    shared_config: Arc<RwLock<ResolvedConfig>>,
+    watcher: &mut ConfigWatcher,
+) -> Result<bool> {
+    loop {
+        tokio::select! {
+            // Accept new connections
+            accept_result = listener.accept() => {
+                let (stream, peer_addr) = accept_result?;
+                let config = Arc::clone(&shared_config);
+                let tls = tls_acceptor.clone();
+
+                tokio::spawn(async move {
+                    let result = if let Some(ref tls_acceptor) = tls {
+                        match tls_acceptor.accept(stream).await {
+                            Ok(tls_stream) => handle_ws_connection_shared(tls_stream, config).await,
+                            Err(e) => {
+                                eprintln!("TLS handshake failed from {}: {}", peer_addr, e);
+                                return;
+                            }
+                        }
+                    } else {
+                        handle_ws_connection_shared(stream, config).await
+                    };
+
+                    if let Err(e) = result {
+                        eprintln!("Error handling connection from {}: {}", peer_addr, e);
+                    }
+                });
+            }
+
+            // Handle config changes
+            change = watcher.recv() => {
+                match change {
+                    Some(ConfigChange::RoutingOnly(new_config)) => {
+                        // Hot-reload: just update the routing config
+                        match ResolvedConfig::from_file_config(&new_config) {
+                            Ok(resolved) => {
+                                let mut config = shared_config.write().await;
+                                *config = resolved;
+                                eprintln!("Configuration reloaded (routing updated)");
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to apply config: {}", e);
+                            }
+                        }
+                    }
+                    Some(ConfigChange::FullRestart(_)) => {
+                        // Need to restart - return true to signal restart
+                        return Ok(true);
+                    }
+                    Some(ConfigChange::Error(e)) => {
+                        eprintln!("Config reload error: {}", e);
+                    }
+                    None => {
+                        // Watcher closed
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Builder for creating a `ProxyServer`.
@@ -437,6 +599,93 @@ where
     };
 
     // Run both directions concurrently
+    tokio::select! {
+        result = ws_to_tcp => result?,
+        result = tcp_to_ws => result?,
+    }
+
+    Ok(())
+}
+
+async fn handle_ws_connection_shared<S>(
+    stream: S,
+    config: Arc<RwLock<ResolvedConfig>>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Extract the path from the WebSocket handshake
+    let path = Arc::new(std::sync::Mutex::new(String::new()));
+    let path_clone = Arc::clone(&path);
+
+    #[allow(clippy::result_large_err)]
+    let callback = move |req: &Request, response: Response| {
+        let uri_path = req.uri().path().to_string();
+        *path_clone.lock().unwrap() = uri_path;
+        Ok(response)
+    };
+
+    // Accept WebSocket connection with header callback
+    let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
+
+    // Get the path and find the target (using current config)
+    let request_path = path.lock().unwrap().clone();
+    let target_addr = {
+        let cfg = config.read().await;
+        cfg.routes
+            .get(&request_path)
+            .or_else(|| {
+                let normalized = request_path.trim_end_matches('/');
+                cfg.routes.get(normalized)
+            })
+            .or(cfg.default_target.as_ref())
+            .copied()
+            .ok_or_else(|| Error::no_route_found(request_path.clone()))?
+    };
+
+    let (mut ws_write, mut ws_read) = ws_stream.split();
+
+    // Connect to TCP target
+    let tcp_stream = TcpStream::connect(target_addr).await?;
+    let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
+
+    // Forward WebSocket -> TCP
+    let ws_to_tcp = async {
+        while let Some(msg) = ws_read.next().await {
+            match msg {
+                Ok(Message::Binary(data)) => {
+                    tcp_write.write_all(&data).await?;
+                }
+                Ok(Message::Text(text)) => {
+                    tcp_write.write_all(text.as_bytes()).await?;
+                }
+                Ok(Message::Close(_)) => {
+                    break;
+                }
+                Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {}
+                Err(e) => {
+                    return Err(e.into());
+                }
+            }
+        }
+        Ok::<_, Error>(())
+    };
+
+    // Forward TCP -> WebSocket
+    let tcp_to_ws = async {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            let n = tcp_read.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            ws_write
+                .send(Message::Binary(buf[..n].to_vec().into()))
+                .await?;
+        }
+        Ok::<_, Error>(())
+    };
+
     tokio::select! {
         result = ws_to_tcp => result?,
         result = tcp_to_ws => result?,

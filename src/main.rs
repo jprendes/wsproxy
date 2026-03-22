@@ -14,9 +14,13 @@ struct Cli {
 enum Commands {
     /// Run the proxy server (WebSocket -> TCP)
     Server {
+        /// Path to configuration file (TOML format) with hot-reload support
+        #[arg(short, long, conflicts_with_all = ["listen", "route", "default_target", "tls_cert", "tls_key", "tls_self_signed"])]
+        config: Option<String>,
+
         /// Address to listen for WebSocket connections (e.g., "0.0.0.0:8080")
-        #[arg(short, long)]
-        listen: String,
+        #[arg(short, long, required_unless_present = "config")]
+        listen: Option<String>,
 
         /// Route mapping in the format "path=target" (e.g., "/ssh=127.0.0.1:22")
         /// Can be specified multiple times
@@ -70,9 +74,13 @@ enum Commands {
 enum DaemonAction {
     /// Run the proxy server as a daemon with automatic restart
     Server {
+        /// Path to configuration file (TOML format) with hot-reload support
+        #[arg(short, long, conflicts_with_all = ["listen", "route", "default_target", "tls_cert", "tls_key", "tls_self_signed"])]
+        config: Option<String>,
+
         /// Address to listen for WebSocket connections (e.g., "0.0.0.0:8080")
-        #[arg(short, long)]
-        listen: String,
+        #[arg(short, long, required_unless_present = "config")]
+        listen: Option<String>,
 
         /// Route mapping in the format "path=target" (e.g., "/ssh=127.0.0.1:22")
         /// Can be specified multiple times
@@ -143,6 +151,7 @@ async fn run() -> wsproxy::Result<()> {
 
     match cli.command {
         Commands::Server {
+            config,
             listen,
             route,
             default_target,
@@ -150,28 +159,46 @@ async fn run() -> wsproxy::Result<()> {
             tls_key,
             tls_self_signed,
         } => {
-            let tls = match (tls_cert, tls_key, tls_self_signed) {
-                (Some(cert), Some(key), false) => wsproxy::server::TlsMode::Files {
-                    cert: cert.leak(),
-                    key: key.leak(),
-                },
-                (None, None, true) => wsproxy::server::TlsMode::SelfSigned,
-                _ => wsproxy::server::TlsMode::None,
-            };
-
-            // Check if we should monitor stdin for parent death (daemon mode)
-            if daemon::should_monitor_stdin() {
-                tokio::select! {
-                    result = wsproxy::server::run(&listen, &route, default_target.as_deref(), tls) => {
-                        result?;
+            // Config file mode with hot-reload
+            if let Some(config_path) = config {
+                if daemon::should_monitor_stdin() {
+                    tokio::select! {
+                        result = wsproxy::server::run_with_config(&config_path) => {
+                            result?;
+                        }
+                        _ = daemon::wait_for_stdin_close() => {
+                            eprintln!("Parent daemon died, shutting down server");
+                            std::process::exit(0);
+                        }
                     }
-                    _ = daemon::wait_for_stdin_close() => {
-                        eprintln!("Parent daemon died, shutting down server");
-                        std::process::exit(0);
-                    }
+                } else {
+                    wsproxy::server::run_with_config(&config_path).await?;
                 }
             } else {
-                wsproxy::server::run(&listen, &route, default_target.as_deref(), tls).await?;
+                // CLI mode
+                let listen = listen.expect("listen is required when not using config");
+                let tls = match (tls_cert, tls_key, tls_self_signed) {
+                    (Some(cert), Some(key), false) => wsproxy::server::TlsMode::Files {
+                        cert: cert.leak(),
+                        key: key.leak(),
+                    },
+                    (None, None, true) => wsproxy::server::TlsMode::SelfSigned,
+                    _ => wsproxy::server::TlsMode::None,
+                };
+
+                if daemon::should_monitor_stdin() {
+                    tokio::select! {
+                        result = wsproxy::server::run(&listen, &route, default_target.as_deref(), tls) => {
+                            result?;
+                        }
+                        _ = daemon::wait_for_stdin_close() => {
+                            eprintln!("Parent daemon died, shutting down server");
+                            std::process::exit(0);
+                        }
+                    }
+                } else {
+                    wsproxy::server::run(&listen, &route, default_target.as_deref(), tls).await?;
+                }
             }
         }
 
@@ -204,6 +231,7 @@ async fn run() -> wsproxy::Result<()> {
 
         Commands::Daemon { action } => match action {
             DaemonAction::Server {
+                config,
                 listen,
                 route,
                 default_target,
@@ -212,6 +240,7 @@ async fn run() -> wsproxy::Result<()> {
                 tls_self_signed,
             } => {
                 daemon::spawn_server(
+                    config,
                     listen,
                     route,
                     default_target,

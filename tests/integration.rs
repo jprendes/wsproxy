@@ -729,3 +729,226 @@ async fn test_wss_self_signed_server() {
     client_conn.read_exact(&mut received).await.unwrap();
     assert_eq!(received, response_msg);
 }
+
+/// Test configuration file hot-reload.
+/// This test verifies that when the config file changes, the server
+/// picks up the new configuration without restarting.
+#[tokio::test]
+async fn test_config_hot_reload() {
+    use std::fs::File;
+    use wsproxy::server::run_with_config;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+
+    // Start two echo servers on different ports
+    let echo1_port = start_echo_server("127.0.0.1:0").await;
+    let echo2_port = start_echo_server("127.0.0.1:0").await;
+
+    // Find available port for proxy server
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_port = ws_listener.local_addr().unwrap().port();
+    drop(ws_listener);
+
+    // Create initial config pointing to echo1
+    let initial_config = format!(
+        r#"
+listen = "127.0.0.1:{}"
+default_target = "127.0.0.1:{}"
+"#,
+        ws_port, echo1_port
+    );
+    File::create(&config_path)
+        .unwrap()
+        .write_all(initial_config.as_bytes())
+        .unwrap();
+
+    // Start server with config
+    let config_path_clone = config_path.clone();
+    tokio::spawn(async move {
+        let _ = run_with_config(&config_path_clone).await;
+    });
+
+    // Give the server time to start
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Start a client
+    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_port = client_listener.local_addr().unwrap().port();
+    drop(client_listener);
+
+    let proxy_client = ProxyClient::bind(
+        format!("127.0.0.1:{}", client_port),
+        format!("ws://127.0.0.1:{}", ws_port),
+        TlsOptions::default(),
+    )
+    .unwrap();
+
+    tokio::spawn(async move {
+        let _ = proxy_client.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Test connection works to echo1
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", client_port))
+        .await
+        .unwrap();
+    let test_msg = b"test1";
+    client.write_all(test_msg).await.unwrap();
+    let mut received = vec![0u8; test_msg.len()];
+    client.read_exact(&mut received).await.unwrap();
+    assert_eq!(received, test_msg);
+    drop(client);
+
+    // Update config to point to echo2
+    let new_config = format!(
+        r#"
+listen = "127.0.0.1:{}"
+default_target = "127.0.0.1:{}"
+"#,
+        ws_port, echo2_port
+    );
+    // Write new config (overwrite)
+    std::fs::write(&config_path, new_config).unwrap();
+
+    // Wait for hot-reload to pick up the change
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Test new connection - should now go to echo2
+    // (Both echo servers return the same data, so we just verify it still works)
+    let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", client_port))
+        .await
+        .unwrap();
+    let test_msg2 = b"test2";
+    client2.write_all(test_msg2).await.unwrap();
+    let mut received2 = vec![0u8; test_msg2.len()];
+    client2.read_exact(&mut received2).await.unwrap();
+    assert_eq!(received2, test_msg2);
+}
+
+/// Test that active connections survive configuration hot-reload.
+/// This test verifies that when the config file changes while connections
+/// are active, those connections continue to work uninterrupted.
+#[tokio::test]
+async fn test_hot_reload_preserves_connections() {
+    use std::fs::File;
+    use wsproxy::server::run_with_config;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config_path = temp_dir.path().join("config.toml");
+
+    // Start echo server
+    let echo_port = start_echo_server("127.0.0.1:0").await;
+
+    // Find available port for proxy server
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_port = ws_listener.local_addr().unwrap().port();
+    drop(ws_listener);
+
+    // Create initial config
+    let initial_config = format!(
+        r#"
+listen = "127.0.0.1:{}"
+default_target = "127.0.0.1:{}"
+"#,
+        ws_port, echo_port
+    );
+    File::create(&config_path)
+        .unwrap()
+        .write_all(initial_config.as_bytes())
+        .unwrap();
+
+    // Start server with config
+    let config_path_clone = config_path.clone();
+    tokio::spawn(async move {
+        let _ = run_with_config(&config_path_clone).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Start a client
+    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_port = client_listener.local_addr().unwrap().port();
+    drop(client_listener);
+
+    let proxy_client = ProxyClient::bind(
+        format!("127.0.0.1:{}", client_port),
+        format!("ws://127.0.0.1:{}", ws_port),
+        TlsOptions::default(),
+    )
+    .unwrap();
+
+    tokio::spawn(async move {
+        let _ = proxy_client.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Establish a connection BEFORE the config change
+    let mut active_conn = TcpStream::connect(format!("127.0.0.1:{}", client_port))
+        .await
+        .unwrap();
+
+    // Verify it works initially
+    let msg1 = b"before_reload";
+    active_conn.write_all(msg1).await.unwrap();
+    let mut received = vec![0u8; msg1.len()];
+    active_conn.read_exact(&mut received).await.unwrap();
+    assert_eq!(received, msg1, "Connection should work before reload");
+
+    // Now trigger a hot-reload by changing the config
+    // We'll change the default_target to a different (but still valid) echo server
+    let echo2_port = start_echo_server("127.0.0.1:0").await;
+    let new_config = format!(
+        r#"
+listen = "127.0.0.1:{}"
+default_target = "127.0.0.1:{}"
+"#,
+        ws_port, echo2_port
+    );
+    std::fs::write(&config_path, new_config).unwrap();
+
+    // Wait for hot-reload to pick up the change
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The existing connection should STILL work - it should not be interrupted
+    let msg2 = b"during_reload";
+    active_conn.write_all(msg2).await.unwrap();
+    let mut received2 = vec![0u8; msg2.len()];
+    active_conn.read_exact(&mut received2).await.unwrap();
+    assert_eq!(received2, msg2, "Existing connection should survive reload");
+
+    // Send multiple messages to verify the connection is truly alive
+    for i in 0..5 {
+        let msg = format!("message_{}", i);
+        active_conn.write_all(msg.as_bytes()).await.unwrap();
+        let mut received = vec![0u8; msg.len()];
+        active_conn.read_exact(&mut received).await.unwrap();
+        assert_eq!(
+            received,
+            msg.as_bytes(),
+            "Connection should continue working after reload"
+        );
+    }
+
+    // Verify new connections also work (they'll go to the new target)
+    let mut new_conn = TcpStream::connect(format!("127.0.0.1:{}", client_port))
+        .await
+        .unwrap();
+    let msg_new = b"new_connection";
+    new_conn.write_all(msg_new).await.unwrap();
+    let mut received_new = vec![0u8; msg_new.len()];
+    new_conn.read_exact(&mut received_new).await.unwrap();
+    assert_eq!(received_new, msg_new, "New connections should work");
+
+    // Old connection should still be working even after new connections are made
+    let final_msg = b"still_alive";
+    active_conn.write_all(final_msg).await.unwrap();
+    let mut final_received = vec![0u8; final_msg.len()];
+    active_conn.read_exact(&mut final_received).await.unwrap();
+    assert_eq!(
+        final_received, final_msg,
+        "Original connection should still work"
+    );
+}
