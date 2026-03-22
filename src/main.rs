@@ -146,6 +146,24 @@ enum DaemonAction {
     Kill {
         /// The daemon ID to kill (from `daemon list`)
         id: u32,
+
+        /// Force immediate shutdown without draining connections
+        #[arg(short, long)]
+        force: bool,
+    },
+
+    /// Update wsproxy binary with graceful connection draining
+    ///
+    /// This command:
+    /// 1. Stops all daemon listeners from accepting new connections
+    /// 2. Replaces the current wsproxy binary with the new one
+    /// 3. Restarts all daemons with the new binary
+    ///
+    /// Existing connections continue to be served by the old binary
+    /// until they naturally close.
+    Update {
+        /// Path to the new wsproxy binary
+        path: String,
     },
 }
 
@@ -178,15 +196,12 @@ async fn run() -> wsproxy::Result<()> {
             // Config file mode with hot-reload
             if let Some(config_path) = config {
                 if daemon::should_monitor_stdin() {
-                    tokio::select! {
-                        result = wsproxy::server::run_with_config(&config_path) => {
-                            result?;
-                        }
-                        _ = daemon::wait_for_stdin_close() => {
-                            eprintln!("Parent daemon died, shutting down server");
-                            std::process::exit(0);
-                        }
-                    }
+                    wsproxy::server::run_with_config_until_shutdown(
+                        &config_path,
+                        daemon::wait_for_stdin_close(),
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await?;
                 } else {
                     wsproxy::server::run_with_config(&config_path).await?;
                 }
@@ -203,15 +218,15 @@ async fn run() -> wsproxy::Result<()> {
                 };
 
                 if daemon::should_monitor_stdin() {
-                    tokio::select! {
-                        result = wsproxy::server::run(&listen, &route, default_target.as_deref(), tls) => {
-                            result?;
-                        }
-                        _ = daemon::wait_for_stdin_close() => {
-                            eprintln!("Parent daemon died, shutting down server");
-                            std::process::exit(0);
-                        }
-                    }
+                    wsproxy::server::run_until_shutdown(
+                        &listen,
+                        &route,
+                        default_target.as_deref(),
+                        tls,
+                        daemon::wait_for_stdin_close(),
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await?;
                 } else {
                     wsproxy::server::run(&listen, &route, default_target.as_deref(), tls).await?;
                 }
@@ -231,15 +246,14 @@ async fn run() -> wsproxy::Result<()> {
 
             // Check if we should monitor stdin for parent death (daemon mode)
             if daemon::should_monitor_stdin() {
-                tokio::select! {
-                    result = wsproxy::client::run(&listen, &server, &tls_options) => {
-                        result?;
-                    }
-                    _ = daemon::wait_for_stdin_close() => {
-                        eprintln!("Parent daemon died, shutting down client");
-                        std::process::exit(0);
-                    }
-                }
+                wsproxy::client::run_until_shutdown(
+                    &listen,
+                    &server,
+                    &tls_options,
+                    daemon::wait_for_stdin_close(),
+                    std::time::Duration::from_secs(30),
+                )
+                .await?;
             } else {
                 wsproxy::client::run(&listen, &server, &tls_options).await?;
             }
@@ -301,13 +315,21 @@ async fn run() -> wsproxy::Result<()> {
                 }
             }
 
-            DaemonAction::Kill { id } => {
-                if daemon::kill(id)? {
-                    println!("Daemon {} killed", id);
+            DaemonAction::Kill { id, force } => {
+                if daemon::kill(id, force)? {
+                    if force {
+                        println!("Daemon {} force killed", id);
+                    } else {
+                        println!("Daemon {} killed (draining connections)", id);
+                    }
                 } else {
                     eprintln!("Daemon {} not found or could not be killed", id);
                     std::process::exit(1);
                 }
+            }
+
+            DaemonAction::Update { path } => {
+                daemon::update(&path)?;
             }
         },
     }

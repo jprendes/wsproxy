@@ -272,6 +272,63 @@ impl DaemonRunner {
             .status()
             .expect("Failed to start client daemon")
     }
+
+    fn kill(&self, id: u32) -> std::process::ExitStatus {
+        use std::process::{Command, Stdio};
+
+        Command::new(WSPROXY_BIN)
+            .args(["daemon", "kill", &id.to_string()])
+            .env(REGISTRY_FILE_ENV, self.registry_file())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("Failed to kill daemon")
+    }
+
+    fn force_kill(&self, id: u32) -> std::process::ExitStatus {
+        use std::process::{Command, Stdio};
+
+        Command::new(WSPROXY_BIN)
+            .args(["daemon", "kill", "--force", &id.to_string()])
+            .env(REGISTRY_FILE_ENV, self.registry_file())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("Failed to force kill daemon")
+    }
+
+    fn update(&self, binary_path: &str) -> std::process::ExitStatus {
+        use std::process::{Command, Stdio};
+
+        Command::new(WSPROXY_BIN)
+            .args(["daemon", "update", binary_path])
+            .env(REGISTRY_FILE_ENV, self.registry_file())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .status()
+            .expect("Failed to update daemon")
+    }
+
+    fn list(&self) -> Vec<u32> {
+        use std::process::Command;
+
+        let output = Command::new(WSPROXY_BIN)
+            .args(["daemon", "list"])
+            .env(REGISTRY_FILE_ENV, self.registry_file())
+            .output()
+            .expect("Failed to list daemons");
+
+        let list_output = String::from_utf8_lossy(&output.stdout);
+        let mut ids = Vec::new();
+        for line in list_output.lines().skip(2) {
+            if let Some(id) = line.split_whitespace().next()
+                && let Ok(id) = id.parse::<u32>()
+            {
+                ids.push(id);
+            }
+        }
+        ids
+    }
 }
 
 impl Drop for DaemonRunner {
@@ -290,8 +347,9 @@ impl Drop for DaemonRunner {
             if let Some(id) = line.split_whitespace().next()
                 && id.parse::<u32>().is_ok()
             {
+                // Use force kill for cleanup to avoid waiting for drain
                 Command::new(WSPROXY_BIN)
-                    .args(["daemon", "kill", id])
+                    .args(["daemon", "kill", "--force", id])
                     .env(REGISTRY_FILE_ENV, &registry_file)
                     .output()
                     .ok();
@@ -939,4 +997,230 @@ default_target = "127.0.0.1:{}"
         final_received, final_msg,
         "Original connection should still work"
     );
+}
+
+/// Test graceful shutdown - existing connections should be allowed to drain.
+#[tokio::test]
+async fn test_graceful_shutdown_drains_connections() {
+    let runner = DaemonRunner::new();
+
+    // Start TCP echo server
+    let echo_port = start_echo_server("127.0.0.1:0").await;
+
+    // Find available ports
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_port = ws_listener.local_addr().unwrap().port();
+    drop(ws_listener);
+
+    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_port = client_listener.local_addr().unwrap().port();
+    drop(client_listener);
+
+    // Start server and client daemons
+    let status = runner.spawn_server(&[
+        "--listen",
+        &format!("127.0.0.1:{}", ws_port),
+        "--default-target",
+        &format!("127.0.0.1:{}", echo_port),
+    ]);
+    assert!(status.success(), "Server daemon failed");
+
+    let status = runner.spawn_client(&[
+        "--listen",
+        &format!("127.0.0.1:{}", client_port),
+        "--server",
+        &format!("ws://127.0.0.1:{}", ws_port),
+    ]);
+    assert!(status.success(), "Client daemon failed");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Establish a connection
+    let mut conn = TcpStream::connect(format!("127.0.0.1:{}", client_port))
+        .await
+        .expect("Failed to connect");
+
+    // Verify connection works
+    let msg1 = b"before_kill";
+    conn.write_all(msg1).await.unwrap();
+    let mut received = vec![0u8; msg1.len()];
+    conn.read_exact(&mut received).await.unwrap();
+    assert_eq!(received, msg1);
+
+    // Graceful kill (daemon ID 1 = server, ID 2 = client)
+    // Kill the client daemon gracefully - it should drain connections
+    let status = runner.kill(2);
+    assert!(status.success(), "Kill command failed");
+
+    // Connection should STILL work - graceful shutdown drains existing connections
+    let msg2 = b"after_graceful_kill";
+    conn.write_all(msg2).await.unwrap();
+    let mut received2 = vec![0u8; msg2.len()];
+
+    // Use a timeout - if drain works, we should get a response
+    let result =
+        tokio::time::timeout(Duration::from_secs(5), conn.read_exact(&mut received2)).await;
+
+    assert!(
+        result.is_ok(),
+        "Connection should still work during graceful drain"
+    );
+    assert_eq!(received2, msg2);
+}
+
+/// Test force shutdown - connections should be terminated immediately.
+#[tokio::test]
+async fn test_force_shutdown_terminates_connections() {
+    let runner = DaemonRunner::new();
+
+    // Start TCP echo server
+    let echo_port = start_echo_server("127.0.0.1:0").await;
+
+    // Find available ports
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_port = ws_listener.local_addr().unwrap().port();
+    drop(ws_listener);
+
+    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_port = client_listener.local_addr().unwrap().port();
+    drop(client_listener);
+
+    // Start server and client daemons
+    let status = runner.spawn_server(&[
+        "--listen",
+        &format!("127.0.0.1:{}", ws_port),
+        "--default-target",
+        &format!("127.0.0.1:{}", echo_port),
+    ]);
+    assert!(status.success(), "Server daemon failed");
+
+    let status = runner.spawn_client(&[
+        "--listen",
+        &format!("127.0.0.1:{}", client_port),
+        "--server",
+        &format!("ws://127.0.0.1:{}", ws_port),
+    ]);
+    assert!(status.success(), "Client daemon failed");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Establish a connection
+    let mut conn = TcpStream::connect(format!("127.0.0.1:{}", client_port))
+        .await
+        .expect("Failed to connect");
+
+    // Verify connection works
+    let msg1 = b"before_force_kill";
+    conn.write_all(msg1).await.unwrap();
+    let mut received = vec![0u8; msg1.len()];
+    conn.read_exact(&mut received).await.unwrap();
+    assert_eq!(received, msg1);
+
+    // Force kill the client daemon - it should terminate immediately
+    let status = runner.force_kill(2);
+    assert!(status.success(), "Force kill command failed");
+
+    // Give it a moment for the process to die
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Connection should be broken - force kill doesn't drain
+    let msg2 = b"after_force_kill";
+    let write_result = conn.write_all(msg2).await;
+
+    // Either write fails, or subsequent read fails
+    if write_result.is_ok() {
+        let mut received2 = vec![0u8; msg2.len()];
+        let read_result =
+            tokio::time::timeout(Duration::from_secs(1), conn.read_exact(&mut received2)).await;
+
+        // Should either timeout or error - connection was killed
+        assert!(
+            read_result.is_err() || read_result.unwrap().is_err(),
+            "Connection should be terminated after force kill"
+        );
+    }
+    // If write failed, that's also expected
+}
+
+/// Test daemon update - binary should be updated and daemons restarted.
+#[tokio::test]
+async fn test_daemon_update() {
+    let runner = DaemonRunner::new();
+
+    // Copy the binary to a temp file to simulate updating with a different file
+    let temp_dir = tempfile::tempdir().unwrap();
+    let new_binary_path = temp_dir.path().join("wsproxy_new");
+    std::fs::copy(WSPROXY_BIN, &new_binary_path).expect("Failed to copy binary");
+
+    // Start TCP echo server
+    let echo_port = start_echo_server("127.0.0.1:0").await;
+
+    // Find available ports
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_port = ws_listener.local_addr().unwrap().port();
+    drop(ws_listener);
+
+    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_port = client_listener.local_addr().unwrap().port();
+    drop(client_listener);
+
+    // Start server and client daemons
+    let status = runner.spawn_server(&[
+        "--listen",
+        &format!("127.0.0.1:{}", ws_port),
+        "--default-target",
+        &format!("127.0.0.1:{}", echo_port),
+    ]);
+    assert!(status.success(), "Server daemon failed");
+
+    let status = runner.spawn_client(&[
+        "--listen",
+        &format!("127.0.0.1:{}", client_port),
+        "--server",
+        &format!("ws://127.0.0.1:{}", ws_port),
+    ]);
+    assert!(status.success(), "Client daemon failed");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Verify daemons are running
+    assert_eq!(runner.list().len(), 2, "Should have 2 daemons running");
+
+    // Establish a connection before update
+    let mut conn_before = TcpStream::connect(format!("127.0.0.1:{}", client_port))
+        .await
+        .expect("Failed to connect before update");
+
+    let msg1 = b"before_update";
+    conn_before.write_all(msg1).await.unwrap();
+    let mut received = vec![0u8; msg1.len()];
+    conn_before.read_exact(&mut received).await.unwrap();
+    assert_eq!(received, msg1);
+
+    // Run update with the copied binary
+    let status = runner.update(new_binary_path.to_str().unwrap());
+    assert!(status.success(), "Update command failed");
+
+    // Give time for old daemons to drain and new ones to start
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    // Verify daemons are still running (new ones spawned after update)
+    let ids_after = runner.list();
+    assert_eq!(
+        ids_after.len(),
+        2,
+        "Should have 2 daemons running after update"
+    );
+
+    // Old connection might still work (draining) or be closed
+    // New connections should definitely work
+    let mut conn_after = TcpStream::connect(format!("127.0.0.1:{}", client_port))
+        .await
+        .expect("Failed to connect after update");
+
+    let msg2 = b"after_update";
+    conn_after.write_all(msg2).await.unwrap();
+    let mut received2 = vec![0u8; msg2.len()];
+    conn_after.read_exact(&mut received2).await.unwrap();
+    assert_eq!(received2, msg2, "New connections should work after update");
 }

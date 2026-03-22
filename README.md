@@ -149,6 +149,26 @@ ID   PID      ARGUMENTS
 wsproxy daemon kill 1
 ```
 
+This performs a **graceful shutdown**: existing connections are allowed to drain before the process exits. For an immediate shutdown:
+
+```bash
+wsproxy daemon kill --force 1
+```
+
+**Update wsproxy binary with zero downtime:**
+
+```bash
+wsproxy daemon update /path/to/new/wsproxy
+```
+
+This command:
+1. Signals all daemon restart loops to stop
+2. Old workers continue serving existing connections (graceful drain)
+3. Replaces the current binary with the new one
+4. Restarts all daemons with the new binary
+
+New connections are handled by the updated binary immediately, while existing connections complete naturally on the old binary.
+
 Daemons automatically restart with exponential backoff (1ms to 5 minutes) if the underlying process crashes.
 
 ### Configuration File

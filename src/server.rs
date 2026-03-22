@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -285,6 +286,60 @@ pub async fn run(
     server.run().await
 }
 
+/// Run a proxy server until a shutdown signal is received.
+///
+/// This is similar to `run()` but supports graceful shutdown when the
+/// shutdown future completes. Existing connections will be allowed to
+/// drain for up to `drain_timeout` before forcing shutdown.
+pub async fn run_until_shutdown<F>(
+    listen: &str,
+    routes: &[String],
+    default_target: Option<&str>,
+    tls: TlsMode<'_>,
+    shutdown: F,
+    drain_timeout: std::time::Duration,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()>,
+{
+    let mut builder = ProxyServer::builder();
+
+    for r in routes {
+        let (path, target) = r.split_once('=').ok_or_else(|| {
+            Error::config(format!(
+                "Invalid route format '{}', expected 'path=target'",
+                r
+            ))
+        })?;
+        builder = builder.route(path.to_string(), target.to_string());
+    }
+
+    if let Some(target) = default_target {
+        builder = builder.default_target(target.to_string());
+    }
+
+    let is_tls = !matches!(tls, TlsMode::None);
+    match tls {
+        TlsMode::None => {}
+        TlsMode::Files { cert, key } => {
+            builder = builder.tls(cert, key);
+        }
+        TlsMode::SelfSigned => {
+            builder = builder.tls_self_signed();
+        }
+    }
+
+    let server = builder.bind(listen)?;
+
+    if is_tls {
+        eprintln!("Proxy server listening on {} (WSS)", listen);
+    } else {
+        eprintln!("Proxy server listening on {}", listen);
+    }
+
+    server.run_until_shutdown(shutdown, drain_timeout).await
+}
+
 /// Run a proxy server with configuration loaded from a file.
 ///
 /// This function watches the config file for changes and hot-reloads
@@ -356,6 +411,202 @@ pub async fn run_with_config(config_path: impl AsRef<Path>) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Run a proxy server with configuration loaded from a file, with graceful shutdown support.
+///
+/// This is similar to `run_with_config()` but supports graceful shutdown when the
+/// shutdown future completes. Existing connections will be allowed to drain for
+/// up to `drain_timeout` before forcing shutdown.
+pub async fn run_with_config_until_shutdown<F>(
+    config_path: impl AsRef<Path>,
+    shutdown: F,
+    drain_timeout: std::time::Duration,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()>,
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::sync::Notify;
+
+    let config_path = config_path.as_ref();
+
+    // Shared state for connection tracking
+    let active_connections = Arc::new(AtomicUsize::new(0));
+    let shutdown_notify = Arc::new(Notify::new());
+
+    // Pin the shutdown future so we can poll it
+    tokio::pin!(shutdown);
+
+    loop {
+        // Load initial config
+        let config = ServerFileConfig::load(config_path)?;
+        let resolved = ResolvedConfig::from_file_config(&config)?;
+
+        // Build the server
+        let tls_acceptor = build_tls_acceptor(&config)?;
+
+        let is_tls = config.has_tls();
+        if is_tls {
+            eprintln!(
+                "Proxy server listening on {} (WSS) - config: {}",
+                config.listen,
+                config_path.display()
+            );
+        } else {
+            eprintln!(
+                "Proxy server listening on {} - config: {}",
+                config.listen,
+                config_path.display()
+            );
+        }
+
+        // Create shared routing config for hot-reload
+        let shared_config = Arc::new(RwLock::new(resolved));
+
+        // Set up config file watcher
+        let mut watcher = ConfigWatcher::new(config_path, config.clone())?;
+
+        // Bind the listener
+        let listener = TcpListener::bind(&config.listen).await?;
+
+        // Run the server with hot-reload support and shutdown handling
+        let result = run_server_loop_with_shutdown(
+            listener,
+            tls_acceptor,
+            shared_config,
+            &mut watcher,
+            &mut shutdown,
+            Arc::clone(&active_connections),
+            Arc::clone(&shutdown_notify),
+        )
+        .await?;
+
+        match result {
+            ServerLoopResult::Restart => {
+                eprintln!("Configuration changed, restarting server...");
+                continue;
+            }
+            ServerLoopResult::Stop => {
+                break;
+            }
+            ServerLoopResult::Shutdown => {
+                // Graceful shutdown - wait for connections to drain
+                eprintln!("Shutdown signal received, draining connections...");
+                let start = std::time::Instant::now();
+                while active_connections.load(Ordering::SeqCst) > 0 {
+                    if start.elapsed() > drain_timeout {
+                        eprintln!(
+                            "Drain timeout reached with {} active connections",
+                            active_connections.load(Ordering::SeqCst)
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                eprintln!("Graceful shutdown complete");
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+enum ServerLoopResult {
+    Restart,
+    Stop,
+    Shutdown,
+}
+
+async fn run_server_loop_with_shutdown<F>(
+    listener: TcpListener,
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    shared_config: Arc<RwLock<ResolvedConfig>>,
+    watcher: &mut ConfigWatcher,
+    shutdown: &mut std::pin::Pin<&mut F>,
+    active_connections: Arc<std::sync::atomic::AtomicUsize>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
+) -> Result<ServerLoopResult>
+where
+    F: std::future::Future<Output = ()>,
+{
+    use std::sync::atomic::Ordering;
+
+    loop {
+        tokio::select! {
+            // Check shutdown signal
+            _ = &mut *shutdown => {
+                shutdown_notify.notify_waiters();
+                return Ok(ServerLoopResult::Shutdown);
+            }
+
+            // Accept new connections
+            accept_result = listener.accept() => {
+                let (stream, peer_addr) = accept_result?;
+                let config = Arc::clone(&shared_config);
+                let tls = tls_acceptor.clone();
+                let conn_count = Arc::clone(&active_connections);
+                let notify = Arc::clone(&shutdown_notify);
+
+                conn_count.fetch_add(1, Ordering::SeqCst);
+
+                tokio::spawn(async move {
+                    let result = if let Some(ref tls_acceptor) = tls {
+                        match tls_acceptor.accept(stream).await {
+                            Ok(tls_stream) => handle_ws_connection_shared(tls_stream, config).await,
+                            Err(e) => {
+                                eprintln!("TLS handshake failed from {}: {}", peer_addr, e);
+                                conn_count.fetch_sub(1, Ordering::SeqCst);
+                                notify.notify_waiters();
+                                return;
+                            }
+                        }
+                    } else {
+                        handle_ws_connection_shared(stream, config).await
+                    };
+
+                    if let Err(e) = result {
+                        eprintln!("Error handling connection from {}: {}", peer_addr, e);
+                    }
+
+                    conn_count.fetch_sub(1, Ordering::SeqCst);
+                    notify.notify_waiters();
+                });
+            }
+
+            // Handle config changes
+            change = watcher.recv() => {
+                match change {
+                    Some(ConfigChange::RoutingOnly(new_config)) => {
+                        // Hot-reload: just update the routing config
+                        match ResolvedConfig::from_file_config(&new_config) {
+                            Ok(resolved) => {
+                                let mut config = shared_config.write().await;
+                                *config = resolved;
+                                eprintln!("Configuration reloaded (routing updated)");
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to apply config: {}", e);
+                            }
+                        }
+                    }
+                    Some(ConfigChange::FullRestart(_)) => {
+                        // Need to restart - return to signal restart
+                        return Ok(ServerLoopResult::Restart);
+                    }
+                    Some(ConfigChange::Error(e)) => {
+                        eprintln!("Config reload error: {}", e);
+                    }
+                    None => {
+                        // Watcher closed
+                        return Ok(ServerLoopResult::Stop);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn build_tls_acceptor(config: &ServerFileConfig) -> Result<Option<tokio_rustls::TlsAcceptor>> {
@@ -721,6 +972,97 @@ impl ProxyServer {
                 }
             });
         }
+    }
+
+    /// Run the proxy server until a shutdown signal is received.
+    ///
+    /// When the shutdown future completes, the server stops accepting new connections
+    /// but existing connections continue until they naturally close or the timeout expires.
+    ///
+    /// # Arguments
+    ///
+    /// * `shutdown` - A future that completes when shutdown is requested
+    /// * `drain_timeout` - Maximum time to wait for existing connections to drain
+    pub async fn run_until_shutdown<F>(
+        self,
+        shutdown: F,
+        drain_timeout: std::time::Duration,
+    ) -> Result<()>
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let listener = match self.bindable {
+            Bindable::Address(addr) => TcpListener::bind(addr).await?,
+            Bindable::Listener(l) => l,
+        };
+
+        // Track active connections
+        let active_connections = Arc::new(AtomicUsize::new(0));
+
+        tokio::pin!(shutdown);
+
+        loop {
+            tokio::select! {
+                accept_result = listener.accept() => {
+                    let (stream, peer_addr) = accept_result?;
+                    let inner = Arc::clone(&self.inner);
+                    let conn_counter = Arc::clone(&active_connections);
+
+                    conn_counter.fetch_add(1, Ordering::SeqCst);
+
+                    tokio::spawn(async move {
+                        let result = if let Some(ref tls_acceptor) = inner.tls_acceptor {
+                            match tls_acceptor.accept(stream).await {
+                                Ok(tls_stream) => handle_ws_connection(tls_stream, &inner).await,
+                                Err(e) => {
+                                    eprintln!("TLS handshake failed from {}: {}", peer_addr, e);
+                                    conn_counter.fetch_sub(1, Ordering::SeqCst);
+                                    return;
+                                }
+                            }
+                        } else {
+                            handle_ws_connection(stream, &inner).await
+                        };
+
+                        conn_counter.fetch_sub(1, Ordering::SeqCst);
+
+                        if let Err(e) = result {
+                            eprintln!("Error handling connection from {}: {}", peer_addr, e);
+                        }
+                    });
+                }
+                _ = &mut shutdown => {
+                    let active = active_connections.load(Ordering::SeqCst);
+                    if active > 0 {
+                        eprintln!("Shutdown requested, draining {} active connection(s)...", active);
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Drop listener to stop accepting new connections and release the port
+        drop(listener);
+
+        // Wait for active connections to drain (with timeout)
+        let drain_start = std::time::Instant::now();
+        loop {
+            let active = active_connections.load(Ordering::SeqCst);
+            if active == 0 {
+                eprintln!("All connections drained, shutting down.");
+                break;
+            }
+            if drain_start.elapsed() >= drain_timeout {
+                eprintln!(
+                    "Drain timeout reached with {} active connection(s), forcing shutdown.",
+                    active
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        Ok(())
     }
 }
 

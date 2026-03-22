@@ -4,6 +4,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -49,6 +50,31 @@ pub async fn run(listen: &str, server_url: &str, tls_options: &TlsOptions) -> Re
     );
 
     client.run().await
+}
+
+/// Run a proxy client until a shutdown signal is received.
+///
+/// This is similar to `run()` but supports graceful shutdown when the
+/// shutdown future completes. Existing connections will be allowed to
+/// drain for up to `drain_timeout` before forcing shutdown.
+pub async fn run_until_shutdown<F>(
+    listen: &str,
+    server_url: &str,
+    tls_options: &TlsOptions,
+    shutdown: F,
+    drain_timeout: std::time::Duration,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()>,
+{
+    let client = ProxyClient::bind(listen, server_url, tls_options.clone())?;
+
+    eprintln!(
+        "Proxy client listening on {}, forwarding to {}",
+        listen, server_url
+    );
+
+    client.run_until_shutdown(shutdown, drain_timeout).await
 }
 
 /// Run a single tunnel connection using stdin/stdout.
@@ -216,6 +242,84 @@ impl ProxyClient {
                 }
             });
         }
+    }
+
+    /// Run the proxy client until a shutdown signal is received.
+    ///
+    /// When the shutdown future completes, the client stops accepting new connections
+    /// but existing connections continue until they naturally close or the timeout expires.
+    ///
+    /// # Arguments
+    ///
+    /// * `shutdown` - A future that completes when shutdown is requested
+    /// * `drain_timeout` - Maximum time to wait for existing connections to drain
+    pub async fn run_until_shutdown<F>(
+        self,
+        shutdown: F,
+        drain_timeout: std::time::Duration,
+    ) -> Result<()>
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let listener = match self.bindable {
+            Bindable::Address(addr) => TcpListener::bind(addr).await?,
+            Bindable::Listener(l) => l,
+        };
+
+        // Track active connections
+        let active_connections = Arc::new(AtomicUsize::new(0));
+
+        tokio::pin!(shutdown);
+
+        loop {
+            tokio::select! {
+                accept_result = listener.accept() => {
+                    let (stream, peer_addr) = accept_result?;
+                    let server_url = self.inner.server_url.clone();
+                    let tls_options = self.inner.tls_options.clone();
+                    let conn_counter = Arc::clone(&active_connections);
+
+                    conn_counter.fetch_add(1, Ordering::SeqCst);
+
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_tcp_connection(stream, &server_url, &tls_options).await {
+                            eprintln!("Error handling connection from {}: {}", peer_addr, e);
+                        }
+                        conn_counter.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+                _ = &mut shutdown => {
+                    let active = active_connections.load(Ordering::SeqCst);
+                    if active > 0 {
+                        eprintln!("Shutdown requested, draining {} active connection(s)...", active);
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Drop listener to stop accepting new connections and release the port
+        drop(listener);
+
+        // Wait for active connections to drain (with timeout)
+        let drain_start = std::time::Instant::now();
+        loop {
+            let active = active_connections.load(Ordering::SeqCst);
+            if active == 0 {
+                eprintln!("All connections drained, shutting down.");
+                break;
+            }
+            if drain_start.elapsed() >= drain_timeout {
+                eprintln!(
+                    "Drain timeout reached with {} active connection(s), forcing shutdown.",
+                    active
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        Ok(())
     }
 }
 

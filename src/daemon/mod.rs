@@ -282,7 +282,13 @@ pub fn list() -> wsproxy::Result<Vec<DaemonInfo>> {
 }
 
 /// Kill a daemon by ID
-pub fn kill(id: u32) -> wsproxy::Result<bool> {
+///
+/// If `force` is false, sends SIGTERM to the restart loop, which causes
+/// the worker to drain connections gracefully before exiting.
+///
+/// If `force` is true, sends SIGKILL to both the restart loop and worker
+/// processes, immediately terminating all connections.
+pub fn kill(id: u32, force: bool) -> wsproxy::Result<bool> {
     let _lock = registry::FileLock::acquire()
         .map_err(|e| wsproxy::Error::config(format!("Failed to acquire lock: {}", e)))?;
 
@@ -290,7 +296,11 @@ pub fn kill(id: u32) -> wsproxy::Result<bool> {
 
     if let Some(pos) = daemons.iter().position(|d| d.id == id) {
         let daemon = &daemons[pos];
-        let killed = registry::kill_process(daemon.pid);
+        let killed = if force {
+            registry::force_kill_process(daemon.pid)
+        } else {
+            registry::kill_process(daemon.pid)
+        };
 
         if killed {
             daemons.remove(pos);
@@ -314,4 +324,134 @@ pub async fn wait_for_stdin_close() {
 
     // This returns Ok(0) when stdin is closed (EOF)
     let _ = stdin.read(&mut buf).await;
+}
+
+/// Update the wsproxy binary and restart all daemons.
+///
+/// This function:
+/// 1. Reads all running daemon info
+/// 2. Stops each daemon's restart loop (workers continue serving)
+/// 3. Replaces the current binary with the new one
+/// 4. Spawns new daemons with the same arguments
+///
+/// Old workers with active connections will continue until they naturally close.
+pub fn update(new_binary_path: &str) -> wsproxy::Result<()> {
+    use std::fs;
+    use std::path::Path;
+
+    let new_binary = Path::new(new_binary_path);
+
+    // Verify the new binary exists and is executable
+    if !new_binary.exists() {
+        return Err(wsproxy::Error::config(format!(
+            "New binary not found: {}",
+            new_binary_path
+        )));
+    }
+
+    // Get the current executable path
+    let current_exe = std::env::current_exe()
+        .map_err(|e| wsproxy::Error::config(format!("Failed to get current executable: {}", e)))?;
+
+    // Read all daemon info before stopping them
+    let daemons = {
+        let _lock = registry::FileLock::acquire()
+            .map_err(|e| wsproxy::Error::config(format!("Failed to acquire lock: {}", e)))?;
+        registry::read()
+    };
+
+    if daemons.is_empty() {
+        eprintln!("No daemons running. Updating binary only.");
+    } else {
+        eprintln!(
+            "Stopping {} daemon(s) for update (workers will drain)...",
+            daemons.len()
+        );
+
+        // Stop all daemon restart loops (sending SIGTERM)
+        // This will cause stdin to close for workers, triggering graceful drain
+        for daemon in &daemons {
+            registry::kill_process(daemon.pid);
+        }
+    }
+
+    // Clear the registry since we killed all daemons
+    {
+        let _lock = registry::FileLock::acquire()
+            .map_err(|e| wsproxy::Error::config(format!("Failed to acquire lock: {}", e)))?;
+        registry::write(&[])
+            .map_err(|e| wsproxy::Error::config(format!("Failed to clear registry: {}", e)))?;
+    }
+
+    // Replace the current binary with the new one
+    eprintln!(
+        "Updating binary: {} -> {}",
+        new_binary_path,
+        current_exe.display()
+    );
+
+    // We can't replace a running executable directly on most platforms,
+    // so we rename the old one first, then copy the new one in place.
+
+    // Try to clean up old backups first
+    if let Some(parent) = current_exe.parent()
+        && let Some(file_name) = current_exe.file_name()
+    {
+        let file_name = file_name.to_string_lossy();
+        if let Ok(entries) = fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(&format!("{}.old.", file_name)) {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
+    // Find a unique backup name with numbered extension
+    let mut n = 1;
+    let backup_path = loop {
+        let mut name = current_exe.as_os_str().to_owned();
+        name.push(format!(".old.{}", n));
+        let candidate = std::path::PathBuf::from(name);
+        if !candidate.exists() {
+            break candidate;
+        }
+        n += 1;
+    };
+
+    // Rename current to backup
+    fs::rename(&current_exe, &backup_path)
+        .map_err(|e| wsproxy::Error::config(format!("Failed to backup current binary: {}", e)))?;
+
+    // Copy new binary to current location
+    fs::copy(new_binary, &current_exe)
+        .map_err(|e| wsproxy::Error::config(format!("Failed to copy new binary: {}", e)))?;
+
+    // Set executable permissions on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&current_exe)
+            .map_err(|e| wsproxy::Error::config(format!("Failed to get file metadata: {}", e)))?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&current_exe, perms)
+            .map_err(|e| wsproxy::Error::config(format!("Failed to set permissions: {}", e)))?;
+    }
+
+    eprintln!("Binary updated successfully.");
+
+    // Restart all daemons with the same arguments
+    for daemon in &daemons {
+        eprintln!("Restarting daemon {} ({})...", daemon.id, daemon.role);
+        spawn_daemon(daemon.role, daemon.args.clone())?;
+    }
+
+    if !daemons.is_empty() {
+        eprintln!("All {} daemon(s) restarted with new binary.", daemons.len());
+    }
+
+    Ok(())
 }

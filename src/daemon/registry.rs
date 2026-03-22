@@ -143,3 +143,23 @@ pub(crate) fn kill_process(pid: u32) -> bool {
         .map(|p| p.kill_with(Signal::Term).unwrap_or(false))
         .unwrap_or(false)
 }
+
+/// Force kill a process and all its children by PID (cross-platform)
+pub(crate) fn force_kill_process(pid: u32) -> bool {
+    use sysinfo::{Pid, Signal, System};
+
+    let s = System::new_all();
+    let target_pid = Pid::from_u32(pid);
+
+    // First, find and kill all child processes
+    for process in s.processes().values() {
+        if process.parent() == Some(target_pid) {
+            let _ = process.kill_with(Signal::Kill);
+        }
+    }
+
+    // Then kill the parent process
+    s.process(target_pid)
+        .map(|p| p.kill_with(Signal::Kill).unwrap_or(false))
+        .unwrap_or(false)
+}
