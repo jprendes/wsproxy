@@ -63,6 +63,22 @@ enum Commands {
         tls_ca_cert: Option<String>,
     },
 
+    /// Run a single tunnel connection (stdin/stdout -> WebSocket)
+    /// Useful for SSH ProxyCommand
+    Tunnel {
+        /// WebSocket server URL to connect to (e.g., "ws://server:8080/ssh" or "wss://server:8080/ssh")
+        #[arg(short, long)]
+        server: String,
+
+        /// Skip TLS certificate verification (insecure, for self-signed certificates)
+        #[arg(short = 'k', long)]
+        insecure: bool,
+
+        /// Path to CA certificate file (PEM format) for verifying self-signed server certificates
+        #[arg(long)]
+        tls_ca_cert: Option<String>,
+    },
+
     /// Manage daemon processes with automatic restart
     Daemon {
         #[command(subcommand)]
@@ -227,6 +243,19 @@ async fn run() -> wsproxy::Result<()> {
             } else {
                 wsproxy::client::run(&listen, &server, &tls_options).await?;
             }
+        }
+
+        Commands::Tunnel {
+            server,
+            insecure,
+            tls_ca_cert,
+        } => {
+            let tls_options = wsproxy::client::TlsOptions {
+                insecure,
+                ca_cert_path: tls_ca_cert,
+            };
+
+            wsproxy::client::tunnel(&server, &tls_options).await?;
         }
 
         Commands::Daemon { action } => match action {

@@ -50,6 +50,63 @@ pub async fn run(listen: &str, server_url: &str, tls_options: &TlsOptions) -> Re
     client.run().await
 }
 
+/// Run a single tunnel connection using stdin/stdout.
+///
+/// This is useful for SSH ProxyCommand integration. The tunnel connects to
+/// the WebSocket server and forwards data between stdin/stdout and the WebSocket.
+///
+/// # Arguments
+///
+/// * `server_url` - WebSocket server URL to connect to (e.g., "ws://server:8080/ssh")
+/// * `tls_options` - TLS options for certificate verification
+///
+/// # Example SSH Config
+///
+/// ```text
+/// Host myserver
+///   ProxyCommand wsproxy tunnel --server wss://proxy:8080/ssh
+///   User myuser
+///   HostName localhost
+/// ```
+pub async fn tunnel(server_url: &str, tls_options: &TlsOptions) -> Result<()> {
+    use tokio::io::{stdin, stdout};
+
+    // Connect to WebSocket server
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let request = server_url.into_client_request()?;
+    let uri = request.uri();
+    let scheme = uri.scheme_str().unwrap_or("ws");
+    let host = uri
+        .host()
+        .ok_or_else(|| Error::config("missing host in URL"))?;
+    let port = uri
+        .port_u16()
+        .unwrap_or(if scheme == "wss" { 443 } else { 80 });
+
+    let addr = format!("{}:{}", host, port);
+    let tcp_conn = TcpStream::connect(&addr).await?;
+
+    if scheme == "wss" {
+        // TLS connection
+        use tokio_rustls::rustls::pki_types::ServerName;
+
+        let config = build_tls_config(tls_options)?;
+
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let server_name = ServerName::try_from(host.to_string())
+            .map_err(|e| Error::config(format!("invalid server name: {}", e)))?;
+
+        let tls_stream = connector.connect(server_name, tcp_conn).await?;
+        let (ws_stream, _response) = tokio_tungstenite::client_async(request, tls_stream).await?;
+        forward_ws_stdio(ws_stream, stdin(), stdout()).await
+    } else {
+        // Plain TCP connection
+        let (ws_stream, _response) = tokio_tungstenite::client_async(request, tcp_conn).await?;
+        forward_ws_stdio(ws_stream, stdin(), stdout()).await
+    }
+}
+
 #[derive(Debug)]
 struct ProxyClientInner {
     listen_addr: SocketAddr,
@@ -330,6 +387,70 @@ where
     tokio::select! {
         result = tcp_to_ws => result?,
         result = ws_to_tcp => result?,
+    }
+
+    Ok(())
+}
+
+async fn forward_ws_stdio<S, R, W>(
+    ws_stream: tokio_tungstenite::WebSocketStream<S>,
+    mut stdin: R,
+    mut stdout: W,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let (mut ws_write, mut ws_read) = ws_stream.split();
+
+    // Forward stdin -> WebSocket
+    let stdin_to_ws = async {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            let n = stdin.read(&mut buf).await?;
+            if n == 0 {
+                // stdin closed, send close frame
+                let _ = ws_write.send(Message::Close(None)).await;
+                break;
+            }
+            ws_write
+                .send(Message::Binary(buf[..n].to_vec().into()))
+                .await?;
+        }
+        Ok::<_, Error>(())
+    };
+
+    // Forward WebSocket -> stdout
+    let ws_to_stdout = async {
+        while let Some(msg) = ws_read.next().await {
+            match msg {
+                Ok(Message::Binary(data)) => {
+                    stdout.write_all(&data).await?;
+                    stdout.flush().await?;
+                }
+                Ok(Message::Text(text)) => {
+                    stdout.write_all(text.as_bytes()).await?;
+                    stdout.flush().await?;
+                }
+                Ok(Message::Close(_)) => {
+                    break;
+                }
+                Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {
+                    // Handled by the library or ignored
+                }
+                Err(e) => {
+                    return Err(e.into());
+                }
+            }
+        }
+        Ok::<_, Error>(())
+    };
+
+    // Run both directions concurrently
+    tokio::select! {
+        result = stdin_to_ws => result?,
+        result = ws_to_stdout => result?,
     }
 
     Ok(())

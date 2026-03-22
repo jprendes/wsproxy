@@ -78,6 +78,34 @@ wsproxy client --listen 127.0.0.1:2222 --server wss://proxy-server:8443/ssh \
   --tls-ca-cert /path/to/ca.pem
 ```
 
+### SSH ProxyCommand (Tunnel Mode)
+
+The `tunnel` command connects stdin/stdout directly to a WebSocket server, making it perfect for SSH's `ProxyCommand` option:
+
+**Direct tunnel:**
+
+```bash
+wsproxy tunnel --server ws://proxy-server:8080/ssh
+```
+
+**SSH config example:**
+
+```
+Host myserver
+    ProxyCommand wsproxy tunnel --server wss://proxy:8443/ssh
+    User myuser
+```
+
+**With self-signed certificate:**
+
+```
+Host myserver
+    ProxyCommand wsproxy tunnel --server wss://proxy:8443/ssh --insecure
+    User myuser
+```
+
+Now `ssh myserver` will tunnel through the WebSocket proxy.
+
 ### Daemon Mode
 
 Run the server or client as a background daemon with automatic restart on failure:
