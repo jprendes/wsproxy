@@ -44,8 +44,7 @@ async fn test_roundtrip_tcp_ws_tcp() {
     drop(ws_listener);
 
     let proxy_server = ProxyServer::builder()
-        .default_target(&echo_addr)
-        .unwrap()
+        .default_target(echo_addr)
         .bind(format!("127.0.0.1:{}", ws_port))
         .unwrap();
 
@@ -115,9 +114,7 @@ async fn test_multiple_routes() {
 
     let proxy_server = ProxyServer::builder()
         .route("/echo1", format!("127.0.0.1:{}", echo1_port))
-        .unwrap()
         .route("/echo2", format!("127.0.0.1:{}", echo2_port))
-        .unwrap()
         .bind(format!("127.0.0.1:{}", ws_port))
         .unwrap();
 
@@ -194,7 +191,6 @@ async fn test_large_data_transfer() {
 
     let proxy_server = ProxyServer::builder()
         .default_target(format!("127.0.0.1:{}", echo_port))
-        .unwrap()
         .bind(format!("127.0.0.1:{}", ws_port))
         .unwrap();
 

@@ -18,6 +18,63 @@ use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use crate::config::{ConfigChange, ConfigWatcher, ResolvedConfig, ServerFileConfig};
 use crate::error::{Error, Result};
 
+/// A lazy address resolver that resolves the address when a connection is established.
+///
+/// This allows DNS changes to be picked up without restarting the server.
+#[derive(Clone)]
+pub struct Address {
+    resolver: Arc<dyn Fn() -> std::io::Result<SocketAddr> + Send + Sync>,
+}
+
+impl Address {
+    /// Create a new lazy address from anything that implements `ToSocketAddrs`.
+    ///
+    /// The address will be resolved each time `resolve()` is called.
+    pub fn new<T>(addr: T) -> Self
+    where
+        T: ToSocketAddrs + Clone + Send + Sync + 'static,
+    {
+        Address {
+            resolver: Arc::new(move || {
+                addr.clone().to_socket_addrs()?.next().ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "could not resolve address")
+                })
+            }),
+        }
+    }
+
+    /// Resolve the address.
+    ///
+    /// This performs DNS resolution if the address is a hostname.
+    pub fn resolve(&self) -> std::io::Result<SocketAddr> {
+        (self.resolver)()
+    }
+}
+
+impl std::fmt::Debug for Address {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Address").finish_non_exhaustive()
+    }
+}
+
+impl From<String> for Address {
+    fn from(s: String) -> Self {
+        Address::new(s)
+    }
+}
+
+impl From<&'static str> for Address {
+    fn from(s: &'static str) -> Self {
+        Address::new(s.to_string())
+    }
+}
+
+impl From<SocketAddr> for Address {
+    fn from(addr: SocketAddr) -> Self {
+        Address::new(addr)
+    }
+}
+
 /// TLS configuration for the server
 #[derive(Debug, Clone)]
 pub enum TlsConfig {
@@ -85,12 +142,12 @@ pub async fn run(
                 r
             ))
         })?;
-        builder = builder.route(path, target)?;
+        builder = builder.route(path.to_string(), target.to_string());
     }
 
     // Set default target if provided
     if let Some(target) = default_target {
-        builder = builder.default_target(target)?;
+        builder = builder.default_target(target.to_string());
     }
 
     // Set TLS config if provided
@@ -286,19 +343,19 @@ async fn run_server_loop(
 /// # async fn example() -> wsproxy::Result<()> {
 /// // Simple server with a single default target
 /// let server = ProxyServer::builder()
-///     .default_target("127.0.0.1:22")?
+///     .default_target("127.0.0.1:22")
 ///     .bind("0.0.0.0:8080")?;
 ///
 /// // Server with multiple routes
 /// let server = ProxyServer::builder()
-///     .route("/ssh", "127.0.0.1:22")?
-///     .route("/db", "127.0.0.1:5432")?
-///     .route("/redis", "127.0.0.1:6379")?
+///     .route("/ssh", "127.0.0.1:22")
+///     .route("/db", "127.0.0.1:5432")
+///     .route("/redis", "127.0.0.1:6379")
 ///     .bind("0.0.0.0:8080")?;
 ///
 /// // Server with TLS (WSS)
 /// let server = ProxyServer::builder()
-///     .default_target("127.0.0.1:22")?
+///     .default_target("127.0.0.1:22")
 ///     .tls("cert.pem", "key.pem")
 ///     .bind("0.0.0.0:8443")?;
 /// # Ok(())
@@ -306,8 +363,8 @@ async fn run_server_loop(
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct ProxyServerBuilder {
-    routes: HashMap<String, SocketAddr>,
-    default_target: Option<SocketAddr>,
+    routes: HashMap<String, Address>,
+    default_target: Option<Address>,
     tls_config: Option<TlsConfig>,
 }
 
@@ -318,16 +375,27 @@ impl ProxyServerBuilder {
     }
 
     /// Add a route mapping a URL path to a TCP target address.
-    pub fn route(mut self, path: impl Into<String>, target: impl ToSocketAddrs) -> Result<Self> {
-        let target = resolve_addr(target)?;
-        self.routes.insert(path.into(), target);
-        Ok(self)
+    ///
+    /// The target address is resolved when connections are established,
+    /// allowing for DNS changes to be picked up without restarting.
+    pub fn route<T>(mut self, path: impl Into<String>, target: T) -> Self
+    where
+        T: ToSocketAddrs + Clone + Send + Sync + 'static,
+    {
+        self.routes.insert(path.into(), Address::new(target));
+        self
     }
 
     /// Set the default target for paths that don't match any route.
-    pub fn default_target(mut self, target: impl ToSocketAddrs) -> Result<Self> {
-        self.default_target = Some(resolve_addr(target)?);
-        Ok(self)
+    ///
+    /// The target address is resolved when connections are established,
+    /// allowing for DNS changes to be picked up without restarting.
+    pub fn default_target<T>(mut self, target: T) -> Self
+    where
+        T: ToSocketAddrs + Clone + Send + Sync + 'static,
+    {
+        self.default_target = Some(Address::new(target));
+        self
     }
 
     /// Enable TLS (WSS) with the given certificate and key files.
@@ -466,8 +534,8 @@ fn generate_self_signed_cert() -> Result<(Vec<CertificateDer<'static>>, PrivateK
 
 struct ProxyServerInner {
     listen_addr: SocketAddr,
-    routes: HashMap<String, SocketAddr>,
-    default_target: Option<SocketAddr>,
+    routes: HashMap<String, Address>,
+    default_target: Option<Address>,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
 }
 
@@ -536,7 +604,7 @@ where
 
     // Get the path and find the target
     let request_path = path.lock().unwrap().clone();
-    let target_addr = inner
+    let target = inner
         .routes
         .get(&request_path)
         .or_else(|| {
@@ -546,10 +614,10 @@ where
         })
         .or(inner.default_target.as_ref())
         .ok_or_else(|| Error::no_route_found(request_path.clone()))?;
-    let target_addr = *target_addr;
     let (mut ws_write, mut ws_read) = ws_stream.split();
 
-    // Connect to TCP target
+    // Connect to TCP target (resolve address at connection time)
+    let target_addr = target.resolve()?;
     let tcp_stream = TcpStream::connect(target_addr).await?;
     let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
 
@@ -631,7 +699,7 @@ where
 
     // Get the path and find the target (using current config)
     let request_path = path.lock().unwrap().clone();
-    let target_addr = {
+    let target = {
         let cfg = config.read().await;
         cfg.routes
             .get(&request_path)
@@ -640,13 +708,17 @@ where
                 cfg.routes.get(normalized)
             })
             .or(cfg.default_target.as_ref())
-            .copied()
+            .cloned()
             .ok_or_else(|| Error::no_route_found(request_path.clone()))?
     };
 
     let (mut ws_write, mut ws_read) = ws_stream.split();
 
-    // Connect to TCP target
+    // Connect to TCP target (resolve address at connection time)
+    let target_addr = target
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| Error::config("could not resolve address"))?;
     let tcp_stream = TcpStream::connect(target_addr).await?;
     let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
 

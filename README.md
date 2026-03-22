@@ -178,7 +178,7 @@ key = "key.pem"
 # Or use: self_signed = true
 ```
 
-Hostnames are resolved using DNS when the configuration is loaded.
+Hostnames are resolved using DNS when each connection is established, allowing DNS changes to take effect without restarting the server.
 
 **Hot-reload behavior:**
 

@@ -82,23 +82,6 @@ impl ServerFileConfig {
             Error::config(format!("invalid listen address '{}': {}", self.listen, e))
         })?;
 
-        // Validate default target if provided
-        if let Some(ref target) = self.default_target {
-            resolve_addr(target).map_err(|e| {
-                Error::config(format!("invalid default_target '{}': {}", target, e))
-            })?;
-        }
-
-        // Validate routes
-        for (path, target) in &self.routes {
-            resolve_addr(target).map_err(|e| {
-                Error::config(format!(
-                    "invalid target '{}' for route '{}': {}",
-                    target, path, e
-                ))
-            })?;
-        }
-
         // Validate TLS config
         if self.tls.self_signed && (self.tls.cert.is_some() || self.tls.key.is_some()) {
             return Err(Error::config("cannot use self_signed with cert/key files"));
@@ -135,41 +118,27 @@ fn resolve_addr(addr: impl ToSocketAddrs) -> std::io::Result<SocketAddr> {
     })
 }
 
-/// Resolved server configuration with parsed addresses
+/// Resolved server configuration with listen address and routes.
+/// Route targets are stored as strings and resolved at connection time.
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
     pub listen_addr: SocketAddr,
-    pub default_target: Option<SocketAddr>,
-    pub routes: HashMap<String, SocketAddr>,
+    pub default_target: Option<String>,
+    pub routes: HashMap<String, String>,
 }
 
 impl ResolvedConfig {
-    /// Create resolved config from file config
+    /// Create resolved config from file config.
+    /// Only the listen address is resolved immediately; route targets are
+    /// stored as strings and resolved when connections are established.
     pub fn from_file_config(config: &ServerFileConfig) -> Result<Self> {
         let listen_addr = resolve_addr(&config.listen)
             .map_err(|e| Error::config(format!("invalid listen address: {}", e)))?;
 
-        let default_target = config
-            .default_target
-            .as_ref()
-            .map(resolve_addr)
-            .transpose()
-            .map_err(|e| Error::config(format!("invalid default_target: {}", e)))?;
-
-        let routes = config
-            .routes
-            .iter()
-            .map(|(path, target)| {
-                let addr = resolve_addr(target)
-                    .map_err(|e| Error::config(format!("invalid target for '{}': {}", path, e)))?;
-                Ok((path.clone(), addr))
-            })
-            .collect::<Result<HashMap<_, _>>>()?;
-
         Ok(Self {
             listen_addr,
-            default_target,
-            routes,
+            default_target: config.default_target.clone(),
+            routes: config.routes.clone(),
         })
     }
 }
