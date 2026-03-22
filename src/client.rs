@@ -2,7 +2,7 @@
 //!
 //! Listens for TCP connections and forwards data through WebSocket to a server.
 
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
@@ -11,6 +11,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::error::{Error, Result};
+use crate::server::{Bindable, IntoBindable};
 
 /// TLS options for the client
 #[derive(Debug, Clone, Default)]
@@ -131,8 +132,8 @@ struct ProxyClientInner {
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone)]
 pub struct ProxyClient {
+    bindable: Bindable,
     inner: Arc<ProxyClientInner>,
 }
 
@@ -141,20 +142,45 @@ impl ProxyClient {
     ///
     /// # Arguments
     ///
-    /// * `listen_addr` - The address to listen for TCP connections.
+    /// * `bindable` - The address to listen on, or a pre-bound `TcpListener`.
     /// * `server_url` - The WebSocket server URL to connect to (e.g., "ws://127.0.0.1:8080/ssh").
     /// * `tls_options` - TLS options for certificate verification.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use tokio::net::TcpListener;
+    /// use wsproxy::ProxyClient;
+    ///
+    /// # async fn example() -> wsproxy::Result<()> {
+    /// // Bind to a specific address
+    /// let client = ProxyClient::bind(
+    ///     "127.0.0.1:2222",
+    ///     "ws://proxy-server:8080/ssh",
+    ///     Default::default(),
+    /// )?;
+    ///
+    /// // Or use a pre-bound listener (useful for port 0)
+    /// let listener = TcpListener::bind("127.0.0.1:0").await?;
+    /// let port = listener.local_addr()?.port();
+    /// let client = ProxyClient::bind(
+    ///     listener,
+    ///     "ws://proxy-server:8080/ssh",
+    ///     Default::default(),
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn bind(
-        listen_addr: impl ToSocketAddrs,
+        bindable: impl IntoBindable,
         server_url: impl Into<String>,
         tls_options: TlsOptions,
     ) -> Result<Self> {
-        let listen_addr = listen_addr
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| Error::config("could not resolve address"))?;
+        let bindable = bindable.into_bindable()?;
+        let listen_addr = bindable.local_addr()?;
 
         Ok(Self {
+            bindable,
             inner: Arc::new(ProxyClientInner {
                 listen_addr,
                 server_url: server_url.into(),
@@ -163,11 +189,21 @@ impl ProxyClient {
         })
     }
 
+    /// Get the configured listen address.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.inner.listen_addr
+    }
+
     /// Run the proxy client.
     ///
     /// This will listen for TCP connections and forward data through WebSocket to the server.
-    pub async fn run(&self) -> Result<()> {
-        let listener = TcpListener::bind(self.inner.listen_addr).await?;
+    /// If the client was created with a pre-bound `TcpListener` (via `bind(listener, ...)`),
+    /// that listener will be used directly.
+    pub async fn run(self) -> Result<()> {
+        let listener = match self.bindable {
+            Bindable::Address(addr) => TcpListener::bind(addr).await?,
+            Bindable::Listener(l) => l,
+        };
 
         loop {
             let (stream, peer_addr) = listener.accept().await?;

@@ -60,4 +60,4 @@ pub mod server;
 pub use client::{ProxyClient, TlsOptions};
 pub use config::{ConfigChange, ConfigWatcher, ServerFileConfig};
 pub use error::{Error, Result};
-pub use server::{Address, ProxyServer, ProxyServerBuilder, TlsMode};
+pub use server::{Address, Bindable, IntoBindable, ProxyServer, ProxyServerBuilder, TlsMode};

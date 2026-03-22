@@ -38,14 +38,12 @@ async fn test_roundtrip_tcp_ws_tcp() {
     let echo_addr = format!("127.0.0.1:{}", echo_port);
 
     // 2. Start ProxyServer (WS -> TCP echo server)
-    // Get the actual bound address by running the server
     let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ws_port = ws_listener.local_addr().unwrap().port();
-    drop(ws_listener);
 
     let proxy_server = ProxyServer::builder()
         .default_target(echo_addr)
-        .bind(format!("127.0.0.1:{}", ws_port))
+        .bind(ws_listener)
         .unwrap();
 
     tokio::spawn(async move {
@@ -58,10 +56,9 @@ async fn test_roundtrip_tcp_ws_tcp() {
     // 3. Start ProxyClient (TCP -> WS)
     let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client_port = client_listener.local_addr().unwrap().port();
-    drop(client_listener);
 
     let proxy_client = ProxyClient::bind(
-        format!("127.0.0.1:{}", client_port),
+        client_listener,
         format!("ws://127.0.0.1:{}", ws_port),
         TlsOptions::default(),
     )
@@ -110,12 +107,11 @@ async fn test_multiple_routes() {
     // Start ProxyServer with routes
     let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ws_port = ws_listener.local_addr().unwrap().port();
-    drop(ws_listener);
 
     let proxy_server = ProxyServer::builder()
         .route("/echo1", format!("127.0.0.1:{}", echo1_port))
         .route("/echo2", format!("127.0.0.1:{}", echo2_port))
-        .bind(format!("127.0.0.1:{}", ws_port))
+        .bind(ws_listener)
         .unwrap();
 
     tokio::spawn(async move {
@@ -127,10 +123,9 @@ async fn test_multiple_routes() {
     // Start two ProxyClients for different routes
     let client1_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client1_port = client1_listener.local_addr().unwrap().port();
-    drop(client1_listener);
 
     let proxy_client1 = ProxyClient::bind(
-        format!("127.0.0.1:{}", client1_port),
+        client1_listener,
         format!("ws://127.0.0.1:{}/echo1", ws_port),
         TlsOptions::default(),
     )
@@ -138,10 +133,9 @@ async fn test_multiple_routes() {
 
     let client2_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client2_port = client2_listener.local_addr().unwrap().port();
-    drop(client2_listener);
 
     let proxy_client2 = ProxyClient::bind(
-        format!("127.0.0.1:{}", client2_port),
+        client2_listener,
         format!("ws://127.0.0.1:{}/echo2", ws_port),
         TlsOptions::default(),
     )
@@ -187,11 +181,10 @@ async fn test_large_data_transfer() {
 
     let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ws_port = ws_listener.local_addr().unwrap().port();
-    drop(ws_listener);
 
     let proxy_server = ProxyServer::builder()
         .default_target(format!("127.0.0.1:{}", echo_port))
-        .bind(format!("127.0.0.1:{}", ws_port))
+        .bind(ws_listener)
         .unwrap();
 
     tokio::spawn(async move {
@@ -202,10 +195,9 @@ async fn test_large_data_transfer() {
 
     let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client_port = client_listener.local_addr().unwrap().port();
-    drop(client_listener);
 
     let proxy_client = ProxyClient::bind(
-        format!("127.0.0.1:{}", client_port),
+        client_listener,
         format!("ws://127.0.0.1:{}", ws_port),
         TlsOptions::default(),
     )
@@ -772,10 +764,9 @@ default_target = "127.0.0.1:{}"
     // Start a client
     let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client_port = client_listener.local_addr().unwrap().port();
-    drop(client_listener);
 
     let proxy_client = ProxyClient::bind(
-        format!("127.0.0.1:{}", client_port),
+        client_listener,
         format!("ws://127.0.0.1:{}", ws_port),
         TlsOptions::default(),
     )
@@ -868,10 +859,9 @@ default_target = "127.0.0.1:{}"
     // Start a client
     let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client_port = client_listener.local_addr().unwrap().port();
-    drop(client_listener);
 
     let proxy_client = ProxyClient::bind(
-        format!("127.0.0.1:{}", client_port),
+        client_listener,
         format!("ws://127.0.0.1:{}", ws_port),
         TlsOptions::default(),
     )

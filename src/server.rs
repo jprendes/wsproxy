@@ -18,6 +18,118 @@ use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use crate::config::{ConfigChange, ConfigWatcher, ResolvedConfig, ServerFileConfig};
 use crate::error::{Error, Result};
 
+/// An address or pre-bound listener for binding a server.
+///
+/// This allows `bind()` to accept either an address string/SocketAddr
+/// or a pre-bound `TcpListener` (useful when binding to port 0).
+pub enum Bindable {
+    /// Resolved address to bind to when `run()` is called.
+    Address(SocketAddr),
+    /// Pre-bound listener ready to accept connections.
+    Listener(TcpListener),
+}
+
+impl Bindable {
+    /// Create a new `Bindable` from anything that implements `ToSocketAddrs`.
+    pub fn new<T: ToSocketAddrs>(addr: T) -> Result<Self> {
+        let socket_addr = addr
+            .to_socket_addrs()?
+            .next()
+            .ok_or_else(|| Error::config("could not resolve address"))?;
+        Ok(Bindable::Address(socket_addr))
+    }
+
+    /// Get the local address (resolving if needed).
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        match self {
+            Bindable::Address(addr) => Ok(*addr),
+            Bindable::Listener(listener) => listener.local_addr(),
+        }
+    }
+}
+
+impl std::fmt::Debug for Bindable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Bindable::Address(addr) => f.debug_tuple("Bindable::Address").field(addr).finish(),
+            Bindable::Listener(listener) => f
+                .debug_tuple("Bindable::Listener")
+                .field(&listener.local_addr())
+                .finish(),
+        }
+    }
+}
+
+impl From<TcpListener> for Bindable {
+    fn from(listener: TcpListener) -> Self {
+        Bindable::Listener(listener)
+    }
+}
+
+impl From<SocketAddr> for Bindable {
+    fn from(addr: SocketAddr) -> Self {
+        Bindable::Address(addr)
+    }
+}
+
+/// Trait for types that can be converted into a `Bindable`.
+///
+/// This trait is implemented for:
+/// - `TcpListener` - uses the pre-bound listener directly
+/// - Types implementing `ToSocketAddrs` - resolves the address
+pub trait IntoBindable {
+    /// Convert into a `Bindable`.
+    fn into_bindable(self) -> Result<Bindable>;
+}
+
+impl IntoBindable for TcpListener {
+    fn into_bindable(self) -> Result<Bindable> {
+        Ok(Bindable::Listener(self))
+    }
+}
+
+impl IntoBindable for SocketAddr {
+    fn into_bindable(self) -> Result<Bindable> {
+        Ok(Bindable::Address(self))
+    }
+}
+
+impl IntoBindable for &str {
+    fn into_bindable(self) -> Result<Bindable> {
+        Bindable::new(self)
+    }
+}
+
+impl IntoBindable for String {
+    fn into_bindable(self) -> Result<Bindable> {
+        Bindable::new(self.as_str())
+    }
+}
+
+impl IntoBindable for (&str, u16) {
+    fn into_bindable(self) -> Result<Bindable> {
+        Bindable::new(self)
+    }
+}
+
+impl IntoBindable for (std::net::IpAddr, u16) {
+    fn into_bindable(self) -> Result<Bindable> {
+        Ok(Bindable::Address(self.into()))
+    }
+}
+
+impl IntoBindable for (std::net::Ipv4Addr, u16) {
+    fn into_bindable(self) -> Result<Bindable> {
+        Ok(Bindable::Address(self.into()))
+    }
+}
+
+impl IntoBindable for (std::net::Ipv6Addr, u16) {
+    fn into_bindable(self) -> Result<Bindable> {
+        Ok(Bindable::Address(self.into()))
+    }
+}
+
 /// A lazy address resolver that resolves the address when a connection is established.
 ///
 /// This allows DNS changes to be picked up without restarting the server.
@@ -419,17 +531,40 @@ impl ProxyServerBuilder {
         self
     }
 
-    /// Build the `ProxyServer` bound to the given address.
+    /// Build the `ProxyServer` bound to the given address or listener.
     ///
     /// # Arguments
     ///
-    /// * `listen_addr` - The address to listen for WebSocket connections.
+    /// * `bindable` - The address to listen on, or a pre-bound `TcpListener`.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use tokio::net::TcpListener;
+    /// use wsproxy::ProxyServer;
+    ///
+    /// # async fn example() -> wsproxy::Result<()> {
+    /// // Bind to a specific address
+    /// let server = ProxyServer::builder()
+    ///     .default_target("127.0.0.1:22")
+    ///     .bind("0.0.0.0:8080")?;
+    ///
+    /// // Or use a pre-bound listener (useful for port 0)
+    /// let listener = TcpListener::bind("127.0.0.1:0").await?;
+    /// let port = listener.local_addr()?.port();
+    /// let server = ProxyServer::builder()
+    ///     .default_target("127.0.0.1:22")
+    ///     .bind(listener)?;
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
     /// Returns an error if neither routes nor a default target is configured.
-    pub fn bind(self, listen_addr: impl ToSocketAddrs) -> Result<ProxyServer> {
-        let listen_addr = resolve_addr(listen_addr)?;
+    pub fn bind(self, bindable: impl IntoBindable) -> Result<ProxyServer> {
+        let bindable = bindable.into_bindable()?;
+        let listen_addr = bindable.local_addr()?;
 
         if self.routes.is_empty() && self.default_target.is_none() {
             return Err(Error::config(
@@ -458,6 +593,7 @@ impl ProxyServerBuilder {
         };
 
         Ok(ProxyServer {
+            bindable,
             inner: Arc::new(ProxyServerInner {
                 listen_addr,
                 routes: self.routes,
@@ -466,12 +602,6 @@ impl ProxyServerBuilder {
             }),
         })
     }
-}
-
-fn resolve_addr(addr: impl ToSocketAddrs) -> Result<SocketAddr> {
-    addr.to_socket_addrs()?
-        .next()
-        .ok_or_else(|| Error::config("could not resolve address"))
 }
 
 fn load_certs_from_files(
@@ -540,8 +670,8 @@ struct ProxyServerInner {
 }
 
 /// A WebSocket proxy server that forwards WebSocket connections to TCP.
-#[derive(Clone)]
 pub struct ProxyServer {
+    bindable: Bindable,
     inner: Arc<ProxyServerInner>,
 }
 
@@ -551,11 +681,21 @@ impl ProxyServer {
         ProxyServerBuilder::new()
     }
 
+    /// Get the configured listen address.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.inner.listen_addr
+    }
+
     /// Run the proxy server.
     ///
     /// This will listen for WebSocket connections and forward data to the configured TCP target.
-    pub async fn run(&self) -> Result<()> {
-        let listener = TcpListener::bind(self.inner.listen_addr).await?;
+    /// If the server was created with a pre-bound `TcpListener` (via `bind(listener)`),
+    /// that listener will be used directly.
+    pub async fn run(self) -> Result<()> {
+        let listener = match self.bindable {
+            Bindable::Address(addr) => TcpListener::bind(addr).await?,
+            Bindable::Listener(l) => l,
+        };
 
         loop {
             let (stream, peer_addr) = listener.accept().await?;
