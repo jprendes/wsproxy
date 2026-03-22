@@ -7,7 +7,7 @@
 
 mod registry;
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 pub use registry::{DaemonInfo, DaemonRole};
@@ -163,7 +163,7 @@ async fn async_restart_loop() {
 }
 
 /// Spawn a detached daemon process for server
-pub fn spawn_server(
+pub async fn spawn_server(
     config: Option<String>,
     listen: Option<String>,
     route: Vec<String>,
@@ -208,11 +208,11 @@ pub fn spawn_server(
         }
     }
 
-    spawn_daemon(DaemonRole::Server, args)
+    spawn_daemon(DaemonRole::Server, args).await
 }
 
 /// Spawn a detached daemon process for client
-pub fn spawn_client(
+pub async fn spawn_client(
     listen: String,
     server: String,
     insecure: bool,
@@ -235,12 +235,13 @@ pub fn spawn_client(
         args.push(ca_cert.clone());
     }
 
-    spawn_daemon(DaemonRole::Client, args)
+    spawn_daemon(DaemonRole::Client, args).await
 }
 
 /// Spawn a detached daemon process
-fn spawn_daemon(role: DaemonRole, args: Vec<String>) -> wsproxy::Result<()> {
-    use std::io::{BufRead, BufReader};
+async fn spawn_daemon(role: DaemonRole, args: Vec<String>) -> wsproxy::Result<()> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
 
     let exe = std::env::current_exe()
         .map_err(|e| wsproxy::Error::config(format!("Failed to get current executable: {}", e)))?;
@@ -248,6 +249,7 @@ fn spawn_daemon(role: DaemonRole, args: Vec<String>) -> wsproxy::Result<()> {
     // Pre-allocate the daemon ID
     let id = {
         let _lock = registry::FileLock::acquire()
+            .await
             .map_err(|e| wsproxy::Error::config(format!("Failed to acquire lock: {}", e)))?;
         let daemons = registry::read();
         daemons.iter().map(|d| d.id).max().unwrap_or(0) + 1
@@ -268,20 +270,18 @@ fn spawn_daemon(role: DaemonRole, args: Vec<String>) -> wsproxy::Result<()> {
     // without showing a window. This allows GenerateConsoleCtrlEvent during
     // shutdown to target only this daemon, not the parent process.
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
-    }
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
 
     let mut child = cmd
         .spawn()
         .map_err(|e| wsproxy::Error::config(format!("Failed to spawn daemon process: {}", e)))?;
 
-    let pid = child.id();
+    let pid = child.id().expect("Failed to get child PID");
 
     // Register in the registry with the actual PID
     {
         let _lock = registry::FileLock::acquire()
+            .await
             .map_err(|e| wsproxy::Error::config(format!("Failed to acquire lock: {}", e)))?;
         let mut daemons = registry::read();
 
@@ -309,12 +309,11 @@ fn spawn_daemon(role: DaemonRole, args: Vec<String>) -> wsproxy::Result<()> {
     // This ensures the daemon is ready before we return
     let stderr = child.stderr.take().expect("Failed to get stderr");
     let reader = BufReader::new(stderr);
-
-    // Read stderr until we see the "listening on" message, then spawn a thread for the rest
     let mut lines = reader.lines();
-    let mut found_listening = false;
 
-    while let Some(Ok(line)) = lines.next() {
+    // Read stderr until we see the "listening on" message
+    let mut found_listening = false;
+    while let Ok(Some(line)) = lines.next_line().await {
         eprintln!("{}", line);
         if line.contains("listening on") {
             found_listening = true;
@@ -328,9 +327,9 @@ fn spawn_daemon(role: DaemonRole, args: Vec<String>) -> wsproxy::Result<()> {
         ));
     }
 
-    // Continue forwarding stderr in a background thread
-    std::thread::spawn(move || {
-        for line in lines.map_while(Result::ok) {
+    // Continue forwarding stderr in a background task
+    tokio::spawn(async move {
+        while let Ok(Some(line)) = lines.next_line().await {
             eprintln!("{}", line);
         }
     });
@@ -339,8 +338,9 @@ fn spawn_daemon(role: DaemonRole, args: Vec<String>) -> wsproxy::Result<()> {
 }
 
 /// List all registered daemons, cleaning up dead ones
-pub fn list() -> wsproxy::Result<Vec<DaemonInfo>> {
+pub async fn list() -> wsproxy::Result<Vec<DaemonInfo>> {
     let _lock = registry::FileLock::acquire()
+        .await
         .map_err(|e| wsproxy::Error::config(format!("Failed to acquire lock: {}", e)))?;
 
     let daemons = registry::read();
@@ -366,8 +366,9 @@ pub fn list() -> wsproxy::Result<Vec<DaemonInfo>> {
 ///
 /// If `force` is true, sends SIGKILL to immediately terminate the daemon
 /// and all its worker processes, dropping any active connections.
-pub fn shutdown(id: u32, force: bool) -> wsproxy::Result<bool> {
+pub async fn shutdown(id: u32, force: bool) -> wsproxy::Result<bool> {
     let _lock = registry::FileLock::acquire()
+        .await
         .map_err(|e| wsproxy::Error::config(format!("Failed to acquire lock: {}", e)))?;
 
     let mut daemons = registry::read();
@@ -401,7 +402,7 @@ pub fn shutdown(id: u32, force: bool) -> wsproxy::Result<bool> {
 /// 4. Spawns new daemons with the same arguments
 ///
 /// Old workers with active connections will continue until they naturally close.
-pub fn update(new_binary_path: &str) -> wsproxy::Result<()> {
+pub async fn update(new_binary_path: &str) -> wsproxy::Result<()> {
     use std::fs;
     use std::path::Path;
 
@@ -422,6 +423,7 @@ pub fn update(new_binary_path: &str) -> wsproxy::Result<()> {
     // Read all daemon info before stopping them
     let daemons = {
         let _lock = registry::FileLock::acquire()
+            .await
             .map_err(|e| wsproxy::Error::config(format!("Failed to acquire lock: {}", e)))?;
         registry::read()
     };
@@ -443,6 +445,7 @@ pub fn update(new_binary_path: &str) -> wsproxy::Result<()> {
     // Clear the registry since we killed all daemons
     {
         let _lock = registry::FileLock::acquire()
+            .await
             .map_err(|e| wsproxy::Error::config(format!("Failed to acquire lock: {}", e)))?;
         registry::write(&[])
             .map_err(|e| wsproxy::Error::config(format!("Failed to clear registry: {}", e)))?;
@@ -511,7 +514,7 @@ pub fn update(new_binary_path: &str) -> wsproxy::Result<()> {
     // Restart all daemons with the same arguments
     for daemon in &daemons {
         eprintln!("Restarting daemon {} ({})...", daemon.id, daemon.role);
-        spawn_daemon(daemon.role, daemon.args.clone())?;
+        spawn_daemon(daemon.role, daemon.args.clone()).await?;
     }
 
     if !daemons.is_empty() {

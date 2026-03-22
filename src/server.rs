@@ -939,7 +939,7 @@ impl ProxyServer {
         } else {
             eprintln!("Proxy server listening on {}", local_addr);
         }
-        crate::port_registry::report_port(local_addr.port());
+        crate::port_registry::report_port(local_addr.port()).await;
 
         loop {
             let (stream, peer_addr) = listener.accept().await?;
@@ -996,7 +996,7 @@ impl ProxyServer {
         } else {
             eprintln!("Proxy server listening on {}", local_addr);
         }
-        crate::port_registry::report_port(local_addr.port());
+        crate::port_registry::report_port(local_addr.port()).await;
 
         // Track active connections
         let active_connections = Arc::new(AtomicUsize::new(0));

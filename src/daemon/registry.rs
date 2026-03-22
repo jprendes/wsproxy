@@ -66,7 +66,7 @@ pub(crate) struct FileLock {
 }
 
 impl FileLock {
-    pub fn acquire() -> std::io::Result<Self> {
+    pub async fn acquire() -> std::io::Result<Self> {
         let lock_path = lock_path();
         let start = std::time::Instant::now();
         loop {
@@ -91,7 +91,7 @@ impl FileLock {
                             "Timeout waiting for registry lock",
                         ));
                     }
-                    std::thread::sleep(Duration::from_millis(50));
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
                 Err(e) => return Err(e),
             }
@@ -123,8 +123,8 @@ pub(crate) fn write(daemons: &[DaemonInfo]) -> std::io::Result<()> {
 
 /// Unregister a daemon from the registry
 #[allow(dead_code)]
-pub(crate) fn unregister(id: u32) -> std::io::Result<()> {
-    let _lock = FileLock::acquire()?;
+pub(crate) async fn unregister(id: u32) -> std::io::Result<()> {
+    let _lock = FileLock::acquire().await?;
     let mut daemons = read();
     daemons.retain(|d| d.id != id);
     write(&daemons)

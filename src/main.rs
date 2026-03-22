@@ -295,7 +295,8 @@ async fn run() -> wsproxy::Result<()> {
                     tls_cert,
                     tls_key,
                     tls_self_signed,
-                )?;
+                )
+                .await?;
             }
 
             DaemonAction::Client {
@@ -304,11 +305,11 @@ async fn run() -> wsproxy::Result<()> {
                 insecure,
                 tls_ca_cert,
             } => {
-                daemon::spawn_client(listen, server, insecure, tls_ca_cert)?;
+                daemon::spawn_client(listen, server, insecure, tls_ca_cert).await?;
             }
 
             DaemonAction::List { json } => {
-                let daemons = daemon::list()?;
+                let daemons = daemon::list().await?;
                 if json {
                     println!(
                         "{}",
@@ -331,7 +332,7 @@ async fn run() -> wsproxy::Result<()> {
             }
 
             DaemonAction::Shutdown { id, force } => {
-                if daemon::shutdown(id, force)? {
+                if daemon::shutdown(id, force).await? {
                     if force {
                         println!("Daemon {} force killed", id);
                     } else {
@@ -344,7 +345,7 @@ async fn run() -> wsproxy::Result<()> {
             }
 
             DaemonAction::Update { path } => {
-                daemon::update(&path)?;
+                daemon::update(&path).await?;
             }
         },
     }

@@ -49,7 +49,7 @@ struct FileLock {
 }
 
 impl FileLock {
-    fn acquire() -> std::io::Result<Self> {
+    async fn acquire() -> std::io::Result<Self> {
         use std::time::{Duration, Instant};
 
         let lock_path = lock_path();
@@ -76,7 +76,7 @@ impl FileLock {
                             "Timeout waiting for registry lock",
                         ));
                     }
-                    std::thread::sleep(Duration::from_millis(50));
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
                 Err(e) => return Err(e),
             }
@@ -97,18 +97,18 @@ impl Drop for FileLock {
 /// a daemon worker (when `__WSPROXY_DAEMON_ID` env var is set).
 ///
 /// Errors are silently ignored since this is non-critical functionality.
-pub fn report_port(port: u16) {
-    let _ = try_report_port(port);
+pub async fn report_port(port: u16) {
+    let _ = try_report_port(port).await;
 }
 
-fn try_report_port(port: u16) -> std::io::Result<()> {
+async fn try_report_port(port: u16) -> std::io::Result<()> {
     // Get daemon ID from environment
     let id: u32 = std::env::var(DAEMON_ID_VAR)
         .ok()
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "No daemon ID"))?;
 
-    let _lock = FileLock::acquire()?;
+    let _lock = FileLock::acquire().await?;
 
     let path = registry_path();
     let content = fs::read_to_string(&path).unwrap_or_else(|_| "[]".to_string());
