@@ -165,11 +165,11 @@ wsproxy server --config server.toml
 
 ```toml
 listen = "0.0.0.0:8080"
-default_target = "127.0.0.1:22"
+default_target = "localhost:22"
 
 [routes]
-"/ssh" = "127.0.0.1:22"
-"/db" = "127.0.0.1:5432"
+"/ssh" = "ssh-server.internal:22"
+"/db" = "db.example.com:5432"
 "/redis" = "127.0.0.1:6379"
 
 [tls]
@@ -177,6 +177,8 @@ cert = "cert.pem"
 key = "key.pem"
 # Or use: self_signed = true
 ```
+
+Hostnames are resolved using DNS when the configuration is loaded.
 
 **Hot-reload behavior:**
 

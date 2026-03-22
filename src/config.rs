@@ -17,7 +17,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -78,20 +78,20 @@ impl ServerFileConfig {
     /// Validate the configuration
     fn validate(&self) -> Result<()> {
         // Validate listen address
-        self.listen.parse::<SocketAddr>().map_err(|e| {
+        resolve_addr(&self.listen).map_err(|e| {
             Error::config(format!("invalid listen address '{}': {}", self.listen, e))
         })?;
 
         // Validate default target if provided
         if let Some(ref target) = self.default_target {
-            target.parse::<SocketAddr>().map_err(|e| {
+            resolve_addr(target).map_err(|e| {
                 Error::config(format!("invalid default_target '{}': {}", target, e))
             })?;
         }
 
         // Validate routes
         for (path, target) in &self.routes {
-            target.parse::<SocketAddr>().map_err(|e| {
+            resolve_addr(target).map_err(|e| {
                 Error::config(format!(
                     "invalid target '{}' for route '{}': {}",
                     target, path, e
@@ -128,6 +128,13 @@ impl ServerFileConfig {
     }
 }
 
+/// Resolve an address string to a SocketAddr using DNS resolution if needed.
+fn resolve_addr(addr: impl ToSocketAddrs) -> std::io::Result<SocketAddr> {
+    addr.to_socket_addrs()?.next().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "could not resolve address")
+    })
+}
+
 /// Resolved server configuration with parsed addresses
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
@@ -139,15 +146,13 @@ pub struct ResolvedConfig {
 impl ResolvedConfig {
     /// Create resolved config from file config
     pub fn from_file_config(config: &ServerFileConfig) -> Result<Self> {
-        let listen_addr = config
-            .listen
-            .parse()
+        let listen_addr = resolve_addr(&config.listen)
             .map_err(|e| Error::config(format!("invalid listen address: {}", e)))?;
 
         let default_target = config
             .default_target
             .as_ref()
-            .map(|t| t.parse())
+            .map(resolve_addr)
             .transpose()
             .map_err(|e| Error::config(format!("invalid default_target: {}", e)))?;
 
@@ -155,8 +160,7 @@ impl ResolvedConfig {
             .routes
             .iter()
             .map(|(path, target)| {
-                let addr: SocketAddr = target
-                    .parse()
+                let addr = resolve_addr(target)
                     .map_err(|e| Error::config(format!("invalid target for '{}': {}", path, e)))?;
                 Ok((path.clone(), addr))
             })
