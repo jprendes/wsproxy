@@ -75,13 +75,12 @@ impl FileLock {
                 Ok(file) => return Ok(Self { _file: file }),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     // Check if lock is stale (older than 30 seconds)
-                    if let Ok(metadata) = fs::metadata(&lock_path) {
-                        if let Ok(modified) = metadata.modified() {
-                            if modified.elapsed().unwrap_or_default() > Duration::from_secs(30) {
-                                fs::remove_file(&lock_path).ok();
-                                continue;
-                            }
-                        }
+                    if let Ok(metadata) = fs::metadata(&lock_path)
+                        && let Ok(modified) = metadata.modified()
+                        && modified.elapsed().unwrap_or_default() > Duration::from_secs(30)
+                    {
+                        fs::remove_file(&lock_path).ok();
+                        continue;
                     }
                     if start.elapsed() > Duration::from_secs(5) {
                         return Err(std::io::Error::new(

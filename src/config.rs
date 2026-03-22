@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Deserialize;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 
 use crate::error::{Error, Result};
 
