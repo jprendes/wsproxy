@@ -15,7 +15,6 @@ futures-util = "0.3"
 notify = "8"
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-send_ctrlc = { version = "0.6", features = ["tokio"] }
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -42,9 +42,29 @@ pub fn run_restart_loop() -> ! {
     std::process::exit(0);
 }
 
+/// Send SIGINT to a child process for graceful shutdown
+#[cfg(unix)]
+fn interrupt_child(child: &tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        // SAFETY: Standard POSIX kill function
+        unsafe { libc::kill(pid as i32, libc::SIGINT) };
+    }
+}
+
+/// Send CTRL_C to the child's process group for graceful shutdown.
+/// The worker is spawned with CREATE_NEW_PROCESS_GROUP so we can target it specifically.
+#[cfg(windows)]
+fn interrupt_child(child: &tokio::process::Child) {
+    use windows_sys::Win32::System::Console::{CTRL_C_EVENT, GenerateConsoleCtrlEvent};
+
+    if let Some(pid) = child.id() {
+        // SAFETY: Standard Windows console API
+        unsafe { GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid) };
+    }
+}
+
 /// Async implementation of the restart loop
 async fn async_restart_loop() {
-    use send_ctrlc::{Interruptible, InterruptibleCommand};
     use tokio::process::Command as TokioCommand;
 
     const MIN_BACKOFF_MS: u64 = 1;
@@ -86,7 +106,12 @@ async fn async_restart_loop() {
             .env_remove(DAEMON_ENV_VAR)
             .stdin(Stdio::null());
 
-        let mut child = match cmd.spawn_interruptible() {
+        // On Windows, spawn the worker in its own process group so we can
+        // send CTRL_C_EVENT to just this worker (not the daemon).
+        #[cfg(windows)]
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
+
+        let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
                 eprintln!("Failed to start wsproxy {}: {}", role, e);
@@ -117,7 +142,7 @@ async fn async_restart_loop() {
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("Daemon received shutdown signal");
                 // Forward shutdown signal to child for graceful shutdown
-                let _ = child.interrupt();
+                interrupt_child(&child);
                 // Wait for child to finish graceful shutdown
                 let _ = child.wait().await;
                 true // Shutdown was requested
@@ -238,6 +263,15 @@ fn spawn_daemon(role: DaemonRole, args: Vec<String>) -> wsproxy::Result<()> {
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::piped());
+
+    // On Windows, use CREATE_NO_WINDOW to give the daemon its own console
+    // without showing a window. This allows GenerateConsoleCtrlEvent during
+    // shutdown to target only this daemon, not the parent process.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
 
     let mut child = cmd
         .spawn()
