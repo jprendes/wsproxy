@@ -139,32 +139,105 @@ pub(crate) fn is_process_alive(pid: u32) -> bool {
 }
 
 /// Send graceful shutdown signal to a process by PID (cross-platform)
-/// Uses SIGINT, which triggers ctrl_c handler
+///
+/// Sends Ctrl+C (SIGINT) to trigger graceful shutdown with connection draining.
+/// Returns true if signal was sent or process doesn't exist.
 pub(crate) fn kill_process(pid: u32) -> bool {
-    use sysinfo::{Pid, Signal, System};
+    #[cfg(unix)]
+    {
+        // Send SIGINT to daemon - it will forward to worker and wait for graceful shutdown
+        // SAFETY: This is the standard POSIX kill function
+        let result = unsafe { libc::kill(pid as i32, libc::SIGINT) };
+        // Success, or process doesn't exist (already dead)
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
 
-    let s = System::new_all();
-    s.process(Pid::from_u32(pid))
-        .map(|p| p.kill_with(Signal::Interrupt).unwrap_or(false))
-        .unwrap_or(false)
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{
+            AttachConsole, CTRL_C_EVENT, FreeConsole, GenerateConsoleCtrlEvent,
+            SetConsoleCtrlHandler,
+        };
+
+        // SAFETY: These are standard Windows console APIs
+        // No need to save/restore state since this process exits immediately after
+        unsafe {
+            // Detach from our current console (if any) - required before AttachConsole
+            FreeConsole();
+
+            // Attach to the target process's console
+            if AttachConsole(pid) == 0 {
+                return false;
+            }
+
+            // Disable Ctrl-C handling so we don't kill ourselves
+            SetConsoleCtrlHandler(None, 1);
+
+            // Send Ctrl+C to all processes attached to the console
+            GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) != 0
+        }
+    }
 }
 
 /// Force kill a process and all its children by PID (cross-platform)
+/// Returns true if process was killed or doesn't exist.
 pub(crate) fn force_kill_process(pid: u32) -> bool {
-    use sysinfo::{Pid, Signal, System};
+    #[cfg(unix)]
+    {
+        // Use sysinfo to find and kill child processes first
+        use sysinfo::{Pid, System};
 
-    let s = System::new_all();
-    let target_pid = Pid::from_u32(pid);
+        let s = System::new_all();
+        let target_pid = Pid::from_u32(pid);
 
-    // First, find and kill all child processes
-    for process in s.processes().values() {
-        if process.parent() == Some(target_pid) {
-            let _ = process.kill_with(Signal::Kill);
+        // Kill all child processes with SIGKILL
+        for process in s.processes().values() {
+            if process.parent() == Some(target_pid) {
+                // SAFETY: This is the standard POSIX kill function
+                unsafe { libc::kill(process.pid().as_u32() as i32, libc::SIGKILL) };
+            }
         }
+
+        // Then kill the parent with SIGKILL
+        // SAFETY: This is the standard POSIX kill function
+        let result = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        // Success, or process doesn't exist (already dead)
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
     }
 
-    // Then kill the parent process
-    s.process(target_pid)
-        .map(|p| p.kill_with(Signal::Kill).unwrap_or(false))
-        .unwrap_or(false)
+    #[cfg(windows)]
+    {
+        use sysinfo::{Pid, System};
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_TERMINATE, TerminateProcess,
+        };
+
+        let s = System::new_all();
+        let target_pid = Pid::from_u32(pid);
+
+        // Helper to terminate a single process
+        let terminate = |pid: u32| -> bool {
+            // SAFETY: OpenProcess and TerminateProcess are standard Windows APIs
+            unsafe {
+                let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+                if handle.is_null() {
+                    return false;
+                }
+                let result = TerminateProcess(handle, 1) != 0;
+                CloseHandle(handle);
+                result
+            }
+        };
+
+        // Kill all child processes first
+        for process in s.processes().values() {
+            if process.parent() == Some(target_pid) {
+                terminate(process.pid().as_u32());
+            }
+        }
+
+        // Then kill the parent process
+        terminate(pid)
+    }
 }

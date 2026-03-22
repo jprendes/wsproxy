@@ -185,6 +185,13 @@ async fn wait_for_shutdown() {
 fn main() {
     // Check if we're running as the daemon child process
     if daemon::is_daemon_child() {
+        // On Windows, allocate a console so we can receive Ctrl+C signals
+        // from `daemon shutdown` via AttachConsole + GenerateConsoleCtrlEvent
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::System::Console::AllocConsole();
+        }
+
         daemon::run_restart_loop();
     }
 

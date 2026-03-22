@@ -830,6 +830,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "send_ctrlc"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d07beb664b54f51140baf2769d12d5eb07d0e3eccee78fb95c3e76c2644a4cad"
+dependencies = [
+ "libc",
+ "tokio",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1291,6 +1302,15 @@ dependencies = [
 
 [[package]]
 name = "windows-sys"
+version = "0.59.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
+dependencies = [
+ "windows-targets 0.52.6",
+]
+
+[[package]]
+name = "windows-sys"
 version = "0.60.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2f500e4d28234f72040990ec9d39e3a6b950f9f22d3dba18416c35882612bcb"
@@ -1458,10 +1478,12 @@ dependencies = [
  "clap",
  "ctrlc",
  "futures-util",
+ "libc",
  "notify",
  "rcgen",
  "rustls",
  "rustls-pemfile",
+ "send_ctrlc",
  "serde",
  "serde_json",
  "sysinfo",
@@ -1471,6 +1493,7 @@ dependencies = [
  "tokio-tungstenite",
  "toml",
  "webpki-roots",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

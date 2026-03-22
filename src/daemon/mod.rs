@@ -32,6 +32,21 @@ fn get_daemon_id() -> Option<u32> {
 /// Run the daemon restart loop with exponential backoff.
 /// This function never returns - it continuously restarts the subprocess.
 pub fn run_restart_loop() -> ! {
+    // Build a single-threaded tokio runtime for the daemon
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime");
+
+    rt.block_on(async_restart_loop());
+    std::process::exit(0);
+}
+
+/// Async implementation of the restart loop
+async fn async_restart_loop() {
+    use send_ctrlc::{Interruptible, InterruptibleCommand};
+    use tokio::process::Command as TokioCommand;
+
     const MIN_BACKOFF_MS: u64 = 1;
     const MAX_BACKOFF_MS: u64 = 5 * 60 * 1000; // 5 minutes
 
@@ -65,41 +80,57 @@ pub fn run_restart_loop() -> ! {
     loop {
         eprintln!("Starting wsproxy {}...", role);
 
-        // Worker catches SIGINT (Ctrl+C) directly (same process group) for graceful shutdown
-        let mut cmd = Command::new(&child_args[0]);
+        // Spawn worker using tokio's async command
+        let mut cmd = TokioCommand::new(&child_args[0]);
         cmd.args(&child_args[1..])
             .env_remove(DAEMON_ENV_VAR)
             .stdin(Stdio::null());
 
-        let mut child = match cmd.spawn() {
+        let mut child = match cmd.spawn_interruptible() {
             Ok(child) => child,
             Err(e) => {
                 eprintln!("Failed to start wsproxy {}: {}", role, e);
                 eprintln!("Restarting in {} ms...", backoff_ms);
-                std::thread::sleep(Duration::from_millis(backoff_ms));
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                 backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
                 continue;
             }
         };
 
-        let status = child.wait();
+        // Wait for either child to exit OR ctrl_c signal
+        let shutdown_requested = tokio::select! {
+            status = child.wait() => {
+                match status {
+                    Ok(status) if status.success() => {
+                        backoff_ms = MIN_BACKOFF_MS;
+                        eprintln!("wsproxy {} exited successfully", role);
+                    }
+                    Ok(status) => {
+                        eprintln!("wsproxy {} exited with status: {}", role, status);
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to wait for wsproxy {}: {}", role, e);
+                    }
+                }
+                false // Child exited normally, don't shutdown
+            }
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("Daemon received shutdown signal");
+                // Forward shutdown signal to child for graceful shutdown
+                let _ = child.interrupt();
+                // Wait for child to finish graceful shutdown
+                let _ = child.wait().await;
+                true // Shutdown was requested
+            }
+        };
 
-        match status {
-            Ok(status) if status.success() => {
-                // Clean exit, reset backoff
-                backoff_ms = MIN_BACKOFF_MS;
-                eprintln!("wsproxy {} exited successfully", role);
-            }
-            Ok(status) => {
-                eprintln!("wsproxy {} exited with status: {}", role, status);
-            }
-            Err(e) => {
-                eprintln!("Failed to wait for wsproxy {}: {}", role, e);
-            }
+        if shutdown_requested {
+            eprintln!("Daemon exiting.");
+            return;
         }
 
         eprintln!("Restarting in {} ms...", backoff_ms);
-        std::thread::sleep(Duration::from_millis(backoff_ms));
+        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
 
         // Exponential backoff with cap
         backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);

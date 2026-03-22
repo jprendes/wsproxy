@@ -1030,8 +1030,8 @@ default_target = "127.0.0.1:{}"
 
 /// Test graceful shutdown - existing connections should be allowed to drain.
 ///
-/// When SIGINT is sent (via `daemon shutdown`), the worker catches it and
-/// enters drain mode, allowing existing connections to continue working
+/// When Ctrl+C (SIGINT) is sent (via `daemon shutdown`), the worker catches it
+/// and enters drain mode, allowing existing connections to continue working
 /// until they close naturally.
 #[tokio::test]
 async fn test_graceful_shutdown_drains_connections() {
