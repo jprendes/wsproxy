@@ -736,6 +736,7 @@ async fn test_wss_self_signed_server() {
 #[tokio::test]
 async fn test_config_hot_reload() {
     use std::fs::File;
+
     use wsproxy::server::run_with_config;
 
     let temp_dir = tempfile::tempdir().unwrap();
@@ -833,6 +834,7 @@ default_target = "127.0.0.1:{}"
 #[tokio::test]
 async fn test_hot_reload_preserves_connections() {
     use std::fs::File;
+
     use wsproxy::server::run_with_config;
 
     let temp_dir = tempfile::tempdir().unwrap();

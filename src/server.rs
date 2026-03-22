@@ -176,7 +176,8 @@ pub async fn run_with_config(config_path: impl AsRef<Path>) -> Result<()> {
         let listener = TcpListener::bind(&config.listen).await?;
 
         // Run the server with hot-reload support
-        let restart_needed = run_server_loop(listener, tls_acceptor, shared_config, &mut watcher).await?;
+        let restart_needed =
+            run_server_loop(listener, tls_acceptor, shared_config, &mut watcher).await?;
 
         if !restart_needed {
             break;

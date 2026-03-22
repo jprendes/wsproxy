@@ -70,7 +70,6 @@ pub async fn run(listen: &str, server_url: &str, tls_options: &TlsOptions) -> Re
 /// ```
 pub async fn tunnel(server_url: &str, tls_options: &TlsOptions) -> Result<()> {
     use tokio::io::{stdin, stdout};
-
     // Connect to WebSocket server
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 

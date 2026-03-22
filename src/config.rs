@@ -78,9 +78,9 @@ impl ServerFileConfig {
     /// Validate the configuration
     fn validate(&self) -> Result<()> {
         // Validate listen address
-        self.listen
-            .parse::<SocketAddr>()
-            .map_err(|e| Error::config(format!("invalid listen address '{}': {}", self.listen, e)))?;
+        self.listen.parse::<SocketAddr>().map_err(|e| {
+            Error::config(format!("invalid listen address '{}': {}", self.listen, e))
+        })?;
 
         // Validate default target if provided
         if let Some(ref target) = self.default_target {
@@ -92,15 +92,16 @@ impl ServerFileConfig {
         // Validate routes
         for (path, target) in &self.routes {
             target.parse::<SocketAddr>().map_err(|e| {
-                Error::config(format!("invalid target '{}' for route '{}': {}", target, path, e))
+                Error::config(format!(
+                    "invalid target '{}' for route '{}': {}",
+                    target, path, e
+                ))
             })?;
         }
 
         // Validate TLS config
         if self.tls.self_signed && (self.tls.cert.is_some() || self.tls.key.is_some()) {
-            return Err(Error::config(
-                "cannot use self_signed with cert/key files",
-            ));
+            return Err(Error::config("cannot use self_signed with cert/key files"));
         }
         if self.tls.cert.is_some() != self.tls.key.is_some() {
             return Err(Error::config("both cert and key must be provided"));
@@ -138,9 +139,10 @@ pub struct ResolvedConfig {
 impl ResolvedConfig {
     /// Create resolved config from file config
     pub fn from_file_config(config: &ServerFileConfig) -> Result<Self> {
-        let listen_addr = config.listen.parse().map_err(|e| {
-            Error::config(format!("invalid listen address: {}", e))
-        })?;
+        let listen_addr = config
+            .listen
+            .parse()
+            .map_err(|e| Error::config(format!("invalid listen address: {}", e)))?;
 
         let default_target = config
             .default_target
@@ -153,9 +155,9 @@ impl ResolvedConfig {
             .routes
             .iter()
             .map(|(path, target)| {
-                let addr: SocketAddr = target.parse().map_err(|e| {
-                    Error::config(format!("invalid target for '{}': {}", path, e))
-                })?;
+                let addr: SocketAddr = target
+                    .parse()
+                    .map_err(|e| Error::config(format!("invalid target for '{}': {}", path, e)))?;
                 Ok((path.clone(), addr))
             })
             .collect::<Result<HashMap<_, _>>>()?;
@@ -305,7 +307,10 @@ mod tests {
 
         assert_eq!(config.listen, "0.0.0.0:8443");
         assert_eq!(config.routes.get("/ssh"), Some(&"127.0.0.1:22".to_string()));
-        assert_eq!(config.routes.get("/db"), Some(&"127.0.0.1:5432".to_string()));
+        assert_eq!(
+            config.routes.get("/db"),
+            Some(&"127.0.0.1:5432".to_string())
+        );
         assert!(config.has_tls());
     }
 
