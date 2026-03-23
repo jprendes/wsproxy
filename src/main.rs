@@ -1,7 +1,5 @@
 use clap::{Parser, Subcommand};
 
-mod daemon;
-
 #[derive(Parser)]
 #[command(name = "wsproxy")]
 #[command(about = "WebSocket proxy for TCP connections", long_about = None)]
@@ -78,100 +76,6 @@ enum Commands {
         #[arg(long)]
         tls_ca_cert: Option<String>,
     },
-
-    /// Manage daemon processes with automatic restart
-    Daemon {
-        #[command(subcommand)]
-        action: DaemonAction,
-    },
-}
-
-#[derive(Subcommand)]
-enum DaemonAction {
-    /// Run the proxy server as a daemon with automatic restart
-    Server {
-        /// Path to configuration file (TOML format) with hot-reload support
-        #[arg(short, long, conflicts_with_all = ["listen", "route", "default_target", "tls_cert", "tls_key", "tls_self_signed"])]
-        config: Option<String>,
-
-        /// Address to listen for WebSocket connections (e.g., "0.0.0.0:8080")
-        #[arg(short, long, required_unless_present = "config")]
-        listen: Option<String>,
-
-        /// Route mapping in the format "path=target" (e.g., "/ssh=127.0.0.1:22")
-        /// Can be specified multiple times
-        #[arg(short, long, value_name = "PATH=TARGET")]
-        route: Vec<String>,
-
-        /// Default target for paths that don't match any route (e.g., "127.0.0.1:22")
-        #[arg(short, long)]
-        default_target: Option<String>,
-
-        /// Path to TLS certificate file (PEM format) for WSS support
-        #[arg(long, requires = "tls_key", conflicts_with = "tls_self_signed")]
-        tls_cert: Option<String>,
-
-        /// Path to TLS private key file (PEM format) for WSS support
-        #[arg(long, requires = "tls_cert", conflicts_with = "tls_self_signed")]
-        tls_key: Option<String>,
-
-        /// Generate a self-signed TLS certificate for WSS support
-        #[arg(long, conflicts_with_all = ["tls_cert", "tls_key"])]
-        tls_self_signed: bool,
-    },
-
-    /// Run the proxy client as a daemon with automatic restart
-    Client {
-        /// Address to listen for TCP connections (e.g., "127.0.0.1:2222")
-        #[arg(short, long)]
-        listen: String,
-
-        /// WebSocket server URL to connect to (e.g., "ws://server:8080/ssh" or "wss://server:8080/ssh")
-        #[arg(short, long)]
-        server: String,
-
-        /// Skip TLS certificate verification (insecure, for self-signed certificates)
-        #[arg(short = 'k', long)]
-        insecure: bool,
-
-        /// Path to CA certificate file (PEM format) for verifying self-signed server certificates
-        #[arg(long)]
-        tls_ca_cert: Option<String>,
-    },
-
-    /// List all running daemons
-    List {
-        /// Output in JSON format for machine parsing
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// Gracefully shut down a daemon by ID
-    ///
-    /// Sends SIGINT to trigger graceful shutdown, allowing existing
-    /// connections to drain before the process exits.
-    Shutdown {
-        /// The daemon ID to shut down (from `daemon list`)
-        id: u32,
-
-        /// Force immediate shutdown (SIGKILL) without draining connections
-        #[arg(short, long)]
-        force: bool,
-    },
-
-    /// Update wsproxy binary with graceful connection draining
-    ///
-    /// This command:
-    /// 1. Stops all daemon listeners from accepting new connections
-    /// 2. Replaces the current wsproxy binary with the new one
-    /// 3. Restarts all daemons with the new binary
-    ///
-    /// Existing connections continue to be served by the old binary
-    /// until they naturally close.
-    Update {
-        /// Path to the new wsproxy binary
-        path: String,
-    },
 }
 
 /// Wait for Ctrl+C (SIGINT) to trigger graceful shutdown.
@@ -183,14 +87,6 @@ async fn wait_for_shutdown() {
 }
 
 fn main() {
-    // Check if we're running as the daemon child process
-    if daemon::is_daemon_child() {
-        // On Windows, the daemon was spawned with CREATE_NO_WINDOW which gives it
-        // its own hidden console. This allows GenerateConsoleCtrlEvent to send
-        // Ctrl+C to just this daemon during `daemon shutdown`.
-        daemon::run_restart_loop();
-    }
-
     if let Err(e) = run() {
         eprintln!("Error: {e:?}");
         std::process::exit(1);
@@ -276,78 +172,6 @@ async fn run() -> wsproxy::Result<()> {
 
             wsproxy::client::tunnel(&server, &tls_options).await?;
         }
-
-        Commands::Daemon { action } => match action {
-            DaemonAction::Server {
-                config,
-                listen,
-                route,
-                default_target,
-                tls_cert,
-                tls_key,
-                tls_self_signed,
-            } => {
-                daemon::spawn_server(
-                    config,
-                    listen,
-                    route,
-                    default_target,
-                    tls_cert,
-                    tls_key,
-                    tls_self_signed,
-                )
-                .await?;
-            }
-
-            DaemonAction::Client {
-                listen,
-                server,
-                insecure,
-                tls_ca_cert,
-            } => {
-                daemon::spawn_client(listen, server, insecure, tls_ca_cert).await?;
-            }
-
-            DaemonAction::List { json } => {
-                let daemons = daemon::list().await?;
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string(&daemons)
-                            .map_err(|e| wsproxy::Error::config(e.to_string()))?
-                    );
-                } else if daemons.is_empty() {
-                    println!("No daemons running");
-                } else {
-                    println!("{:<4} {:<8} {:<6} ARGUMENTS", "ID", "PID", "PORT");
-                    println!("{}", "-".repeat(60));
-                    for d in daemons {
-                        let port = d
-                            .port
-                            .map(|p| p.to_string())
-                            .unwrap_or_else(|| "-".to_string());
-                        println!("{:<4} {:<8} {:<6} {}", d.id, d.pid, port, d.args.join(" "));
-                    }
-                }
-            }
-
-            DaemonAction::Shutdown { id, force } => {
-                if daemon::shutdown(id, force).await? {
-                    if force {
-                        println!("Daemon {} force killed", id);
-                    } else {
-                        println!("Daemon {} shutting down (draining connections)", id);
-                    }
-                } else {
-                    eprintln!("Daemon {} not found or could not be shut down", id);
-                    std::process::exit(1);
-                }
-            }
-
-            DaemonAction::Update { path } => {
-                daemon::update(&path).await?;
-            }
-        },
     }
 
     Ok(())

@@ -106,70 +106,13 @@ Host myserver
 
 Now `ssh myserver` will tunnel through the WebSocket proxy.
 
-### Daemon Mode
+### Upstart
 
-Run the server or client as a background daemon with automatic restart on failure:
+For systems using Upstart (Ubuntu 14.04 and earlier), see [docs/upstart.md](docs/upstart.md).
 
-**Start a server daemon:**
+### systemd
 
-```bash
-wsproxy daemon server --listen 0.0.0.0:8080 --default-target 127.0.0.1:22
-```
-
-**Start a server daemon with TLS:**
-
-```bash
-wsproxy daemon server --listen 0.0.0.0:8443 --default-target 127.0.0.1:22 \
-  --tls-cert cert.pem --tls-key key.pem
-```
-
-**Start a client daemon:**
-
-```bash
-wsproxy daemon client --listen 127.0.0.1:2222 --server ws://proxy-server:8080/ssh
-```
-
-**List running daemons:**
-
-```bash
-wsproxy daemon list
-```
-
-Output:
-```
-ID   PID      ARGUMENTS
---------------------------------------------------
-1    12345    server --listen 0.0.0.0:8080 --default-target 127.0.0.1:22
-2    12346    client --listen 127.0.0.1:2222 --server ws://proxy-server:8080/ssh
-```
-
-**Kill a daemon:**
-
-```bash
-wsproxy daemon kill 1
-```
-
-This performs a **graceful shutdown**: existing connections are allowed to drain before the process exits. For an immediate shutdown:
-
-```bash
-wsproxy daemon kill --force 1
-```
-
-**Update wsproxy binary with zero downtime:**
-
-```bash
-wsproxy daemon update /path/to/new/wsproxy
-```
-
-This command:
-1. Signals all daemon restart loops to stop
-2. Old workers continue serving existing connections (graceful drain)
-3. Replaces the current binary with the new one
-4. Restarts all daemons with the new binary
-
-New connections are handled by the updated binary immediately, while existing connections complete naturally on the old binary.
-
-Daemons automatically restart with exponential backoff (1ms to 5 minutes) if the underlying process crashes.
+For systems using systemd (most modern Linux distributions), see [docs/systemd.md](docs/systemd.md).
 
 ### Configuration File
 
@@ -205,12 +148,6 @@ Hostnames are resolved using DNS when each connection is established, allowing D
 - **Routes and default_target changes**: Applied instantly. Existing connections continue uninterrupted; new connections use the updated routing.
 - **Listen address or TLS changes**: Server automatically restarts. Existing connections continue until they complete naturally.
 - **Invalid configuration**: If the config file has syntax errors or invalid values, the error is logged and the server continues running with the previous valid configuration. Existing connections are not affected.
-
-**Daemon mode with config:**
-
-```bash
-wsproxy daemon server --config server.toml
-```
 
 Note: The `--config` flag cannot be combined with other server options (`--listen`, `--route`, `--default-target`, `--tls-*`).
 
@@ -276,32 +213,31 @@ This example demonstrates a simple chat through the WebSocket proxy using `nc` (
 nc -l 9000
 ```
 
-**Terminal 2 - Start the proxy server and client as daemons:**
+**Terminal 2 - Start the proxy server:**
 
 ```bash
-wsproxy daemon server --listen 127.0.0.1:8080 --default-target 127.0.0.1:9000
-wsproxy daemon client --listen 127.0.0.1:2222 --server ws://127.0.0.1:8080
+wsproxy server --listen 127.0.0.1:8080 --default-target 127.0.0.1:9000
 ```
 
-**Terminal 2 - Connect to the proxy:**
+**Terminal 3 - Start the proxy client:**
+
+```bash
+wsproxy client --listen 127.0.0.1:2222 --server ws://127.0.0.1:8080
+```
+
+**Terminal 4 - Connect to the proxy:**
 
 ```bash
 nc 127.0.0.1 2222
 ```
 
-Now you can type messages in Terminal 2 and they will appear in Terminal 1 (and vice versa). The data flows:
+Now you can type messages in Terminal 4 and they will appear in Terminal 1 (and vice versa). The data flows:
 
 ```
-Terminal 2 (nc) -> ProxyClient (:2222) -> WebSocket -> ProxyServer (:8080) -> Terminal 1 (nc :9000)
+Terminal 4 (nc) -> ProxyClient (:2222) -> WebSocket -> ProxyServer (:8080) -> Terminal 1 (nc :9000)
 ```
 
-**Clean up - kill the daemons:**
-
-```bash
-wsproxy daemon list   # See running daemons
-wsproxy daemon kill 1 # Kill server
-wsproxy daemon kill 2 # Kill client
-```
+Press Ctrl+C in terminals 2 and 3 to stop the proxies (graceful shutdown).
 
 ## License
 

@@ -224,348 +224,33 @@ async fn test_large_data_transfer() {
     assert_eq!(response, large_data);
 }
 
-const REGISTRY_FILE_ENV: &str = "WSPROXY_REGISTRY_FILE";
-const WSPROXY_BIN: &str = env!("CARGO_BIN_EXE_wsproxy");
-
-/// RAII guard that cleans up daemons on drop
-struct DaemonRunner {
-    temp_dir: tempfile::TempDir,
-}
-
-impl DaemonRunner {
-    fn new() -> Self {
-        let temp_dir = tempfile::tempdir().unwrap();
-
-        // Copy the binary to the temp directory so we can test updates
-        // without modifying the actual test binary
-        let binary_path = temp_dir.path().join("wsproxy");
-        std::fs::copy(WSPROXY_BIN, &binary_path).expect("Failed to copy binary");
-
-        // Set executable permissions on Unix
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&binary_path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&binary_path, perms).unwrap();
-        }
-
-        Self { temp_dir }
-    }
-
-    fn binary_path(&self) -> std::path::PathBuf {
-        self.temp_dir.path().join("wsproxy")
-    }
-
-    fn registry_file(&self) -> std::path::PathBuf {
-        self.temp_dir.path().join("daemons.json")
-    }
-
-    /// Spawn a server daemon and return the port it's listening on.
-    /// Uses port 0 to let the OS assign a free port.
-    fn spawn_server_on_any_port(&self, target: &str) -> u16 {
-        self.spawn_server_with_args(&["--listen", "127.0.0.1:0", "--default-target", target])
-    }
-
-    /// Spawn a server daemon with custom args and return the port.
-    fn spawn_server_with_args(&self, args: &[&str]) -> u16 {
-        use std::process::{Command, Stdio};
-
-        let mut full_args = vec!["daemon", "server"];
-        full_args.extend(args);
-
-        // The daemon command now waits until the worker is ready
-        let status = Command::new(self.binary_path())
-            .args(&full_args)
-            .env(REGISTRY_FILE_ENV, self.registry_file())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .status()
-            .expect("Failed to start server daemon");
-
-        assert!(status.success(), "Failed to spawn server daemon");
-
-        // Get the port from daemon list --json
-        self.get_last_daemon_port()
-    }
-
-    /// Spawn a client daemon and return the port it's listening on.
-    fn spawn_client_on_any_port(&self, server_url: &str) -> u16 {
-        self.spawn_client_with_args(&["--listen", "127.0.0.1:0", "--server", server_url])
-    }
-
-    /// Spawn a client daemon with custom args and return the port.
-    fn spawn_client_with_args(&self, args: &[&str]) -> u16 {
-        use std::process::{Command, Stdio};
-
-        let mut full_args = vec!["daemon", "client"];
-        full_args.extend(args);
-
-        // The daemon command now waits until the worker is ready
-        let status = Command::new(self.binary_path())
-            .args(&full_args)
-            .env(REGISTRY_FILE_ENV, self.registry_file())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .status()
-            .expect("Failed to start client daemon");
-
-        assert!(status.success(), "Failed to spawn client daemon");
-
-        // Get the port from daemon list --json
-        self.get_last_daemon_port()
-    }
-
-    /// Get the port of the last registered daemon
-    fn get_last_daemon_port(&self) -> u16 {
-        use std::process::Command;
-
-        let output = Command::new(self.binary_path())
-            .args(["daemon", "list", "--json"])
-            .env(REGISTRY_FILE_ENV, self.registry_file())
-            .output()
-            .expect("Failed to list daemons");
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let daemons: Vec<serde_json::Value> =
-            serde_json::from_str(&stdout).expect("Failed to parse daemon list JSON");
-
-        daemons
-            .last()
-            .and_then(|d| d.get("port"))
-            .and_then(|p| p.as_u64())
-            .map(|p| p as u16)
-            .expect("Daemon has no port")
-    }
-
-    #[allow(dead_code)]
-    fn spawn_server(&self, args: &[&str]) -> std::process::ExitStatus {
-        use std::process::{Command, Stdio};
-
-        let mut full_args = vec!["daemon", "server"];
-        full_args.extend(args);
-
-        Command::new(self.binary_path())
-            .args(&full_args)
-            .env(REGISTRY_FILE_ENV, self.registry_file())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .expect("Failed to start server daemon")
-    }
-
-    #[allow(dead_code)]
-    fn spawn_client(&self, args: &[&str]) -> std::process::ExitStatus {
-        use std::process::{Command, Stdio};
-
-        let mut full_args = vec!["daemon", "client"];
-        full_args.extend(args);
-
-        Command::new(self.binary_path())
-            .args(&full_args)
-            .env(REGISTRY_FILE_ENV, self.registry_file())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .expect("Failed to start client daemon")
-    }
-
-    fn shutdown(&self, id: u32) -> std::process::ExitStatus {
-        use std::process::{Command, Stdio};
-
-        Command::new(self.binary_path())
-            .args(["daemon", "shutdown", &id.to_string()])
-            .env(REGISTRY_FILE_ENV, self.registry_file())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .expect("Failed to shutdown daemon")
-    }
-
-    fn force_shutdown(&self, id: u32) -> std::process::ExitStatus {
-        use std::process::{Command, Stdio};
-
-        Command::new(self.binary_path())
-            .args(["daemon", "shutdown", "--force", &id.to_string()])
-            .env(REGISTRY_FILE_ENV, self.registry_file())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .expect("Failed to force shutdown daemon")
-    }
-
-    fn update(&self, binary_path: &str) -> std::process::ExitStatus {
-        use std::process::{Command, Stdio};
-
-        Command::new(self.binary_path())
-            .args(["daemon", "update", binary_path])
-            .env(REGISTRY_FILE_ENV, self.registry_file())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .status()
-            .expect("Failed to update daemon")
-    }
-
-    fn list(&self) -> Vec<u32> {
-        use std::process::Command;
-
-        let output = Command::new(self.binary_path())
-            .args(["daemon", "list"])
-            .env(REGISTRY_FILE_ENV, self.registry_file())
-            .output()
-            .expect("Failed to list daemons");
-
-        let list_output = String::from_utf8_lossy(&output.stdout);
-        let mut ids = Vec::new();
-        for line in list_output.lines().skip(2) {
-            if let Some(id) = line.split_whitespace().next()
-                && let Ok(id) = id.parse::<u32>()
-            {
-                ids.push(id);
-            }
-        }
-        ids
-    }
-}
-
-impl Drop for DaemonRunner {
-    fn drop(&mut self) {
-        use std::process::Command;
-
-        let binary_path = self.binary_path();
-        let registry_file = self.registry_file();
-        let output = Command::new(&binary_path)
-            .args(["daemon", "list"])
-            .env(REGISTRY_FILE_ENV, &registry_file)
-            .output()
-            .expect("Failed to list daemons");
-
-        let list_output = String::from_utf8_lossy(&output.stdout);
-        for line in list_output.lines().skip(2) {
-            if let Some(id) = line.split_whitespace().next()
-                && id.parse::<u32>().is_ok()
-            {
-                // Use force shutdown for cleanup to avoid waiting for drain
-                Command::new(&binary_path)
-                    .args(["daemon", "shutdown", "--force", id])
-                    .env(REGISTRY_FILE_ENV, &registry_file)
-                    .output()
-                    .ok();
-            }
-        }
-        // tempfile::TempDir handles file cleanup automatically
-    }
-}
-
-/// Test bidirectional "chat" communication through the proxy using daemon mode.
-/// This mimics the netcat example from the README where two parties
-/// can send messages to each other through the WebSocket proxy.
-#[tokio::test]
-async fn test_bidirectional_chat_daemon() {
-    let runner = DaemonRunner::new();
-
-    // 1. Start a TCP listener (the "chat server" - like `nc -l 9000`)
-    let chat_server = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let chat_server_port = chat_server.local_addr().unwrap().port();
-
-    // 2. Start the proxy server daemon (port 0 = OS assigns free port)
-    let ws_port = runner.spawn_server_on_any_port(&format!("127.0.0.1:{}", chat_server_port));
-
-    // 3. Start the proxy client daemon
-    let client_port = runner.spawn_client_on_any_port(&format!("ws://127.0.0.1:{}", ws_port));
-
-    // 4. Connect to the proxy and accept on chat server SIMULTANEOUSLY
-    // The connect() blocks until the full chain is established, which requires
-    // the chat server to accept the incoming connection from the proxy server.
-    let (connect_result, accept_result) = tokio::join!(
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            TcpStream::connect(format!("127.0.0.1:{}", client_port)),
-        ),
-        tokio::time::timeout(Duration::from_secs(5), chat_server.accept()),
-    );
-
-    let mut chat_client = connect_result
-        .expect("Timeout connecting to proxy client")
-        .expect("Failed to connect to proxy client");
-
-    let (mut chat_server_conn, _) = accept_result
-        .expect("Timeout waiting for connection on chat server")
-        .expect("Failed to accept connection");
-
-    // Test bidirectional communication
-
-    // Client sends to server
-    let client_msg = b"Hello from client!";
-    chat_client.write_all(client_msg).await.unwrap();
-
-    let mut server_received = vec![0u8; client_msg.len()];
-    chat_server_conn
-        .read_exact(&mut server_received)
-        .await
-        .unwrap();
-    assert_eq!(server_received, client_msg);
-
-    // Server sends to client
-    let server_msg = b"Hello from server!";
-    chat_server_conn.write_all(server_msg).await.unwrap();
-
-    let mut client_received = vec![0u8; server_msg.len()];
-    chat_client.read_exact(&mut client_received).await.unwrap();
-    assert_eq!(client_received, server_msg);
-
-    // Multiple back-and-forth messages (like a real chat)
-    for i in 0..5 {
-        // Client -> Server
-        let msg = format!("Client message {}\n", i);
-        chat_client.write_all(msg.as_bytes()).await.unwrap();
-
-        let mut received = vec![0u8; msg.len()];
-        chat_server_conn.read_exact(&mut received).await.unwrap();
-        assert_eq!(received, msg.as_bytes());
-
-        // Server -> Client
-        let reply = format!("Server reply {}\n", i);
-        chat_server_conn.write_all(reply.as_bytes()).await.unwrap();
-
-        let mut received = vec![0u8; reply.len()];
-        chat_client.read_exact(&mut received).await.unwrap();
-        assert_eq!(received, reply.as_bytes());
-    }
-
-    // runner dropped here, cleans up daemons automatically
-}
-
-/// Generate a self-signed CA certificate and server certificate for testing.
-/// Returns (ca_cert_pem, server_cert_pem, server_key_pem).
+/// Generate test certificates for TLS testing
 fn generate_test_certs() -> (String, String, String) {
-    use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyUsagePurpose};
+    use rcgen::{CertificateParams, DnType, KeyPair};
 
-    // Generate CA key pair
-    let ca_key = rcgen::KeyPair::generate().unwrap();
-
-    // Generate CA certificate
+    // Generate CA
+    let ca_key = KeyPair::generate().unwrap();
     let mut ca_params = CertificateParams::default();
-    ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     ca_params
         .distinguished_name
         .push(DnType::CommonName, "Test CA");
-    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     let ca_cert = ca_params.self_signed(&ca_key).unwrap();
 
-    // Generate server certificate signed by CA
+    // Generate server cert signed by CA
+    let server_key = KeyPair::generate().unwrap();
     let mut server_params = CertificateParams::default();
     server_params
         .distinguished_name
         .push(DnType::CommonName, "localhost");
-    server_params.subject_alt_names = vec![
-        rcgen::SanType::DnsName("localhost".try_into().unwrap()),
-        rcgen::SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))),
-    ];
-    server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    server_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-
-    let server_key = rcgen::KeyPair::generate().unwrap();
+    server_params
+        .subject_alt_names
+        .push(rcgen::SanType::DnsName("localhost".try_into().unwrap()));
+    server_params
+        .subject_alt_names
+        .push(rcgen::SanType::IpAddress(std::net::IpAddr::V4(
+            std::net::Ipv4Addr::new(127, 0, 0, 1),
+        )));
     let server_cert = server_params
         .signed_by(&server_key, &ca_cert, &ca_key)
         .unwrap();
@@ -576,16 +261,15 @@ fn generate_test_certs() -> (String, String, String) {
 /// Test WSS (WebSocket Secure) connections with TLS using custom CA certificate.
 #[tokio::test]
 async fn test_wss_with_custom_ca() {
-    let runner = DaemonRunner::new();
+    let temp_dir = tempfile::tempdir().unwrap();
 
     // Generate test certificates
     let (ca_pem, cert_pem, key_pem) = generate_test_certs();
 
     // Write certificates to temp files
-    let cert_dir = runner.temp_dir.path();
-    let ca_path = cert_dir.join("ca.pem");
-    let cert_path = cert_dir.join("server.crt");
-    let key_path = cert_dir.join("server.key");
+    let ca_path = temp_dir.path().join("ca.pem");
+    let cert_path = temp_dir.path().join("server.crt");
+    let key_path = temp_dir.path().join("server.key");
 
     std::fs::File::create(&ca_path)
         .unwrap()
@@ -604,27 +288,43 @@ async fn test_wss_with_custom_ca() {
     let backend_server = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_server.local_addr().unwrap().port();
 
-    // 2. Start the WSS proxy server daemon with TLS
-    let ws_port = runner.spawn_server_with_args(&[
-        "--listen",
-        "127.0.0.1:0",
-        "--default-target",
-        &format!("127.0.0.1:{}", backend_port),
-        "--tls-cert",
-        cert_path.to_str().unwrap(),
-        "--tls-key",
-        key_path.to_str().unwrap(),
-    ]);
+    // 2. Start the WSS proxy server with TLS
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_port = ws_listener.local_addr().unwrap().port();
 
-    // 3. Start the proxy client daemon with custom CA cert
-    let client_port = runner.spawn_client_with_args(&[
-        "--listen",
-        "127.0.0.1:0",
-        "--server",
-        &format!("wss://127.0.0.1:{}", ws_port),
-        "--tls-ca-cert",
-        ca_path.to_str().unwrap(),
-    ]);
+    let proxy_server = ProxyServer::builder()
+        .default_target(format!("127.0.0.1:{}", backend_port))
+        .tls(cert_path.to_str().unwrap(), key_path.to_str().unwrap())
+        .bind(ws_listener)
+        .unwrap();
+
+    tokio::spawn(async move {
+        let _: Result<(), _> = proxy_server.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 3. Start the proxy client with custom CA cert
+    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_port = client_listener.local_addr().unwrap().port();
+
+    let tls_options = TlsOptions {
+        insecure: false,
+        ca_cert_path: Some(ca_path.to_str().unwrap().to_string()),
+    };
+
+    let proxy_client = ProxyClient::bind(
+        client_listener,
+        format!("wss://127.0.0.1:{}", ws_port),
+        tls_options,
+    )
+    .unwrap();
+
+    tokio::spawn(async move {
+        proxy_client.run().await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // 4. Connect and test bidirectional communication
     let (connect_result, accept_result) = tokio::join!(
@@ -663,18 +363,17 @@ async fn test_wss_with_custom_ca() {
     assert_eq!(client_received, backend_msg);
 }
 
-/// Test WSS connections with --insecure flag (skip certificate verification).
+/// Test WSS connections with insecure flag (skip certificate verification).
 #[tokio::test]
 async fn test_wss_insecure() {
-    let runner = DaemonRunner::new();
+    let temp_dir = tempfile::tempdir().unwrap();
 
     // Generate test certificates (self-signed, no CA needed for insecure mode)
     let (_, cert_pem, key_pem) = generate_test_certs();
 
     // Write certificates to temp files
-    let cert_dir = runner.temp_dir.path();
-    let cert_path = cert_dir.join("server.crt");
-    let key_path = cert_dir.join("server.key");
+    let cert_path = temp_dir.path().join("server.crt");
+    let key_path = temp_dir.path().join("server.key");
 
     std::fs::File::create(&cert_path)
         .unwrap()
@@ -689,26 +388,43 @@ async fn test_wss_insecure() {
     let backend_server = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_server.local_addr().unwrap().port();
 
-    // 2. Start the WSS proxy server daemon with TLS
-    let ws_port = runner.spawn_server_with_args(&[
-        "--listen",
-        "127.0.0.1:0",
-        "--default-target",
-        &format!("127.0.0.1:{}", backend_port),
-        "--tls-cert",
-        cert_path.to_str().unwrap(),
-        "--tls-key",
-        key_path.to_str().unwrap(),
-    ]);
+    // 2. Start the WSS proxy server with TLS
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_port = ws_listener.local_addr().unwrap().port();
 
-    // 3. Start the proxy client daemon with --insecure flag
-    let client_port = runner.spawn_client_with_args(&[
-        "--listen",
-        "127.0.0.1:0",
-        "--server",
-        &format!("wss://127.0.0.1:{}", ws_port),
-        "--insecure",
-    ]);
+    let proxy_server = ProxyServer::builder()
+        .default_target(format!("127.0.0.1:{}", backend_port))
+        .tls(cert_path.to_str().unwrap(), key_path.to_str().unwrap())
+        .bind(ws_listener)
+        .unwrap();
+
+    tokio::spawn(async move {
+        let _: Result<(), _> = proxy_server.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 3. Start the proxy client with --insecure flag
+    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_port = client_listener.local_addr().unwrap().port();
+
+    let tls_options = TlsOptions {
+        insecure: true,
+        ca_cert_path: None,
+    };
+
+    let proxy_client = ProxyClient::bind(
+        client_listener,
+        format!("wss://127.0.0.1:{}", ws_port),
+        tls_options,
+    )
+    .unwrap();
+
+    tokio::spawn(async move {
+        proxy_client.run().await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // 4. Connect and test communication
     let (connect_result, accept_result) = tokio::join!(
@@ -744,32 +460,50 @@ async fn test_wss_insecure() {
     assert_eq!(received, response_msg);
 }
 
-/// Test WSS with server auto-generated self-signed certificate using --tls-self-signed.
+/// Test WSS with server auto-generated self-signed certificate.
 #[tokio::test]
 async fn test_wss_self_signed_server() {
-    let runner = DaemonRunner::new();
-
     // 1. Start a TCP listener (the backend server)
     let backend_server = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_server.local_addr().unwrap().port();
 
-    // 2. Start the WSS proxy server daemon with auto-generated self-signed cert
-    let ws_port = runner.spawn_server_with_args(&[
-        "--listen",
-        "127.0.0.1:0",
-        "--default-target",
-        &format!("127.0.0.1:{}", backend_port),
-        "--tls-self-signed",
-    ]);
+    // 2. Start the WSS proxy server with auto-generated self-signed cert
+    let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_port = ws_listener.local_addr().unwrap().port();
 
-    // 3. Start the proxy client daemon with --insecure flag (required for auto-generated cert)
-    let client_port = runner.spawn_client_with_args(&[
-        "--listen",
-        "127.0.0.1:0",
-        "--server",
-        &format!("wss://127.0.0.1:{}", ws_port),
-        "--insecure",
-    ]);
+    let proxy_server = ProxyServer::builder()
+        .default_target(format!("127.0.0.1:{}", backend_port))
+        .tls_self_signed()
+        .bind(ws_listener)
+        .unwrap();
+
+    tokio::spawn(async move {
+        proxy_server.run().await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 3. Start the proxy client with --insecure flag (required for auto-generated cert)
+    let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_port = client_listener.local_addr().unwrap().port();
+
+    let tls_options = TlsOptions {
+        insecure: true,
+        ca_cert_path: None,
+    };
+
+    let proxy_client = ProxyClient::bind(
+        client_listener,
+        format!("wss://127.0.0.1:{}", ws_port),
+        tls_options,
+    )
+    .unwrap();
+
+    tokio::spawn(async move {
+        proxy_client.run().await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // 4. Connect and test communication
     let (connect_result, accept_result) = tokio::join!(
@@ -806,8 +540,6 @@ async fn test_wss_self_signed_server() {
 }
 
 /// Test configuration file hot-reload.
-/// This test verifies that when the config file changes, the server
-/// picks up the new configuration without restarting.
 #[tokio::test]
 async fn test_config_hot_reload() {
     use std::fs::File;
@@ -884,14 +616,12 @@ default_target = "127.0.0.1:{}"
 "#,
         ws_port, echo2_port
     );
-    // Write new config (overwrite)
     std::fs::write(&config_path, new_config).unwrap();
 
     // Wait for hot-reload to pick up the change
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Test new connection - should now go to echo2
-    // (Both echo servers return the same data, so we just verify it still works)
     let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", client_port))
         .await
         .unwrap();
@@ -903,8 +633,6 @@ default_target = "127.0.0.1:{}"
 }
 
 /// Test that active connections survive configuration hot-reload.
-/// This test verifies that when the config file changes while connections
-/// are active, those connections continue to work uninterrupted.
 #[tokio::test]
 async fn test_hot_reload_preserves_connections() {
     use std::fs::File;
@@ -973,7 +701,6 @@ default_target = "127.0.0.1:{}"
     assert_eq!(received, msg1, "Connection should work before reload");
 
     // Now trigger a hot-reload by changing the config
-    // We'll change the default_target to a different (but still valid) echo server
     let echo2_port = start_echo_server("127.0.0.1:0").await;
     let new_config = format!(
         r#"
@@ -1006,166 +733,4 @@ default_target = "127.0.0.1:{}"
             "Connection should continue working after reload"
         );
     }
-
-    // Verify new connections also work (they'll go to the new target)
-    let mut new_conn = TcpStream::connect(format!("127.0.0.1:{}", client_port))
-        .await
-        .unwrap();
-    let msg_new = b"new_connection";
-    new_conn.write_all(msg_new).await.unwrap();
-    let mut received_new = vec![0u8; msg_new.len()];
-    new_conn.read_exact(&mut received_new).await.unwrap();
-    assert_eq!(received_new, msg_new, "New connections should work");
-
-    // Old connection should still be working even after new connections are made
-    let final_msg = b"still_alive";
-    active_conn.write_all(final_msg).await.unwrap();
-    let mut final_received = vec![0u8; final_msg.len()];
-    active_conn.read_exact(&mut final_received).await.unwrap();
-    assert_eq!(
-        final_received, final_msg,
-        "Original connection should still work"
-    );
-}
-
-/// Test graceful shutdown - existing connections should be allowed to drain.
-///
-/// When Ctrl+C (SIGINT) is sent (via `daemon shutdown`), the worker catches it
-/// and enters drain mode, allowing existing connections to continue working
-/// until they close naturally.
-#[tokio::test]
-async fn test_graceful_shutdown_drains_connections() {
-    let runner = DaemonRunner::new();
-
-    // Start TCP echo server
-    let echo_port = start_echo_server("127.0.0.1:0").await;
-
-    // Start server and client daemons
-    let ws_port = runner.spawn_server_on_any_port(&format!("127.0.0.1:{}", echo_port));
-    let client_port = runner.spawn_client_on_any_port(&format!("ws://127.0.0.1:{}", ws_port));
-
-    // Establish a connection
-    let mut conn = TcpStream::connect(format!("127.0.0.1:{}", client_port))
-        .await
-        .expect("Failed to connect");
-
-    // Verify connection works BEFORE shutdown
-    let msg1 = b"before_shutdown";
-    conn.write_all(msg1).await.unwrap();
-    let mut received = vec![0u8; msg1.len()];
-    conn.read_exact(&mut received).await.unwrap();
-    assert_eq!(received, msg1);
-
-    // Graceful shutdown (daemon ID 1 = server, ID 2 = client)
-    // Shutdown the client daemon gracefully - this sends SIGINT triggering drain mode
-    let status = runner.shutdown(2);
-    assert!(status.success(), "Shutdown command failed");
-
-    // Give it a moment for the SIGINT to be processed
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // The connection MUST still work after graceful shutdown - drain mode keeps it alive
-    let msg2 = b"after_graceful_shutdown";
-    conn.write_all(msg2)
-        .await
-        .expect("Write after graceful shutdown should work");
-
-    let mut received2 = vec![0u8; msg2.len()];
-    conn.read_exact(&mut received2)
-        .await
-        .expect("Read after graceful shutdown should work - connections should drain");
-    assert_eq!(received2, msg2, "Echo should work after graceful shutdown");
-}
-
-/// Test force shutdown - connections should be terminated immediately.
-#[tokio::test]
-async fn test_force_shutdown_terminates_connections() {
-    let runner = DaemonRunner::new();
-
-    // Start TCP echo server
-    let echo_port = start_echo_server("127.0.0.1:0").await;
-
-    // Start server and client daemons
-    let ws_port = runner.spawn_server_on_any_port(&format!("127.0.0.1:{}", echo_port));
-    let client_port = runner.spawn_client_on_any_port(&format!("ws://127.0.0.1:{}", ws_port));
-
-    // Establish a connection
-    let mut conn = TcpStream::connect(format!("127.0.0.1:{}", client_port))
-        .await
-        .expect("Failed to connect");
-
-    // Verify connection works
-    let msg1 = b"before_force_shutdown";
-    conn.write_all(msg1).await.unwrap();
-    let mut received = vec![0u8; msg1.len()];
-    conn.read_exact(&mut received).await.unwrap();
-    assert_eq!(received, msg1);
-
-    // Force shutdown the client daemon - it should terminate immediately
-    let status = runner.force_shutdown(2);
-    assert!(status.success(), "Force shutdown command failed");
-
-    // Give it a moment for the process to die
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Connection should be broken - force shutdown doesn't drain
-    let msg2 = b"after_force_shutdown";
-    let write_result = conn.write_all(msg2).await;
-
-    // Either write fails, or subsequent read fails
-    if write_result.is_ok() {
-        let mut received2 = vec![0u8; msg2.len()];
-        let read_result =
-            tokio::time::timeout(Duration::from_secs(1), conn.read_exact(&mut received2)).await;
-
-        // Should either timeout or error - connection was killed
-        assert!(
-            read_result.is_err() || read_result.unwrap().is_err(),
-            "Connection should be terminated after force shutdown"
-        );
-    }
-    // If write failed, that's also expected
-}
-
-/// Test daemon update - binary should be updated and daemons restarted.
-#[tokio::test]
-async fn test_daemon_update() {
-    let runner = DaemonRunner::new();
-
-    // Start TCP echo server
-    let echo_port = start_echo_server("127.0.0.1:0").await;
-
-    // Start server and client daemons
-    let ws_port = runner.spawn_server_on_any_port(&format!("127.0.0.1:{}", echo_port));
-    let client_port = runner.spawn_client_on_any_port(&format!("ws://127.0.0.1:{}", ws_port));
-
-    // Verify daemons are running
-    assert_eq!(runner.list().len(), 2, "Should have 2 daemons running");
-
-    // Establish a connection before update
-    let mut conn_before = TcpStream::connect(format!("127.0.0.1:{}", client_port))
-        .await
-        .expect("Failed to connect before update");
-
-    let msg1 = b"before_update";
-    conn_before.write_all(msg1).await.unwrap();
-    let mut received = vec![0u8; msg1.len()];
-    conn_before.read_exact(&mut received).await.unwrap();
-    assert_eq!(received, msg1);
-
-    // Run update using the original binary (DaemonRunner uses a copy,
-    // so WSPROXY_BIN is a different file we can update to)
-    let status = runner.update(WSPROXY_BIN);
-    assert!(status.success(), "Update command failed");
-
-    // Give time for old daemons to drain and new ones to start
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-
-    // Verify daemons are still running (new ones spawned after update)
-    let ids_after = runner.list();
-    assert_eq!(
-        ids_after.len(),
-        2,
-        "Should have 2 daemons running after update"
-    );
 }

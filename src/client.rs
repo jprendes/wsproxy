@@ -225,7 +225,6 @@ impl ProxyClient {
             "Proxy client listening on {}, forwarding to {}",
             local_addr, self.inner.server_url
         );
-        crate::port_registry::report_port(local_addr.port()).await;
 
         loop {
             let (stream, peer_addr) = listener.accept().await?;
@@ -268,7 +267,6 @@ impl ProxyClient {
             "Proxy client listening on {}, forwarding to {}",
             local_addr, self.inner.server_url
         );
-        crate::port_registry::report_port(local_addr.port()).await;
 
         // Track active connections
         let active_connections = Arc::new(AtomicUsize::new(0));
