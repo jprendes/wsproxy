@@ -18,4 +18,3 @@ COPY --from=builder /app/target/release/wsproxy /wsproxy
 EXPOSE 8080
 
 ENTRYPOINT ["/wsproxy"]
-CMD ["server", "--listen", "0.0.0.0:8080"]
