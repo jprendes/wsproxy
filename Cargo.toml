@@ -11,6 +11,7 @@ repository = "https://github.com/jprendes/wsproxy"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
+matchit = "0.8"
 notify = "8"
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

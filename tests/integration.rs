@@ -109,8 +109,8 @@ async fn test_multiple_routes() {
     let ws_port = ws_listener.local_addr().unwrap().port();
 
     let proxy_server = ProxyServer::builder()
-        .route("/echo1", format!("127.0.0.1:{}", echo1_port))
-        .route("/echo2", format!("127.0.0.1:{}", echo2_port))
+        .route("/echo1", format!("127.0.0.1:{}", echo1_port)).unwrap()
+        .route("/echo2", format!("127.0.0.1:{}", echo2_port)).unwrap()
         .bind(ws_listener)
         .unwrap();
 

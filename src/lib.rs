@@ -33,9 +33,9 @@
 //!
 //!     // Server with multiple routes (different endpoints -> different TCP targets)
 //!     let server = ProxyServer::builder()
-//!         .route("/ssh", "127.0.0.1:22")
-//!         .route("/db", "127.0.0.1:5432")
-//!         .route("/redis", "127.0.0.1:6379")
+//!         .route("/ssh", "127.0.0.1:22")?
+//!         .route("/db", "127.0.0.1:5432")?
+//!         .route("/redis", "127.0.0.1:6379")?
 //!         .bind("0.0.0.0:8080")?;
 //!
 //!     // Client: listen for TCP on port 2222, forward to WebSocket server
@@ -55,9 +55,11 @@
 pub mod client;
 pub mod config;
 mod error;
+mod router;
 pub mod server;
 
 pub use client::{ProxyClient, TlsOptions};
 pub use config::{ConfigChange, ConfigWatcher, ServerFileConfig};
 pub use error::{Error, Result};
+pub use router::Router;
 pub use server::{Address, Bindable, IntoBindable, ProxyServer, ProxyServerBuilder, TlsMode};

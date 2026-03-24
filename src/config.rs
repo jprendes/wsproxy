@@ -26,6 +26,7 @@ use serde::Deserialize;
 use tokio::sync::{RwLock, mpsc};
 
 use crate::error::{Error, Result};
+use crate::router::Router;
 
 /// TLS configuration in config file
 #[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
@@ -124,7 +125,7 @@ fn resolve_addr(addr: impl ToSocketAddrs) -> std::io::Result<SocketAddr> {
 pub struct ResolvedConfig {
     pub listen_addr: SocketAddr,
     pub default_target: Option<String>,
-    pub routes: HashMap<String, String>,
+    pub router: Router,
 }
 
 impl ResolvedConfig {
@@ -135,10 +136,15 @@ impl ResolvedConfig {
         let listen_addr = resolve_addr(&config.listen)
             .map_err(|e| Error::config(format!("invalid listen address: {}", e)))?;
 
+        let mut router = Router::new();
+        for (path, target) in &config.routes {
+            router.insert(path, target)?;
+        }
+
         Ok(Self {
             listen_addr,
             default_target: config.default_target.clone(),
-            routes: config.routes.clone(),
+            router,
         })
     }
 }

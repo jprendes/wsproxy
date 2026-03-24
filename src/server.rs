@@ -2,7 +2,6 @@
 //!
 //! Listens for WebSocket connections and forwards data to a TCP target.
 
-use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::sync::Arc;
@@ -18,6 +17,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
 use crate::config::{ConfigChange, ConfigWatcher, ResolvedConfig, ServerFileConfig};
 use crate::error::{Error, Result};
+use crate::router::Router;
 
 /// An address or pre-bound listener for binding a server.
 ///
@@ -255,7 +255,7 @@ pub async fn run(
                 r
             ))
         })?;
-        builder = builder.route(path.to_string(), target.to_string());
+        builder = builder.route(path.to_string(), target.to_string())?;
     }
 
     // Set default target if provided
@@ -303,7 +303,7 @@ where
                 r
             ))
         })?;
-        builder = builder.route(path.to_string(), target.to_string());
+        builder = builder.route(path.to_string(), target.to_string())?;
     }
 
     if let Some(target) = default_target {
@@ -695,9 +695,9 @@ async fn run_server_loop(
 ///
 /// // Server with multiple routes
 /// let server = ProxyServer::builder()
-///     .route("/ssh", "127.0.0.1:22")
-///     .route("/db", "127.0.0.1:5432")
-///     .route("/redis", "127.0.0.1:6379")
+///     .route("/ssh", "127.0.0.1:22")?
+///     .route("/db", "127.0.0.1:5432")?
+///     .route("/redis", "127.0.0.1:6379")?
 ///     .bind("0.0.0.0:8080")?;
 ///
 /// // Server with TLS (WSS)
@@ -710,7 +710,7 @@ async fn run_server_loop(
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct ProxyServerBuilder {
-    routes: HashMap<String, Address>,
+    router: Router,
     default_target: Option<Address>,
     tls_config: Option<TlsConfig>,
 }
@@ -721,16 +721,20 @@ impl ProxyServerBuilder {
         Self::default()
     }
 
-    /// Add a route mapping a URL path to a TCP target address.
+    /// Add a route mapping a URL path pattern to a TCP target template.
+    ///
+    /// Supports path parameters like `{host}` and wildcards like `{*path}`:
+    /// - `/ssh/{host}` matches `/ssh/myserver` with `host=myserver`
+    /// - `/files/{*path}` matches `/files/a/b/c` with `path=a/b/c`
+    ///
+    /// Parameters can be used in target templates:
+    /// - Pattern `/ssh/{host}` with target `{host}:22` → `/ssh/myserver` resolves to `myserver:22`
     ///
     /// The target address is resolved when connections are established,
     /// allowing for DNS changes to be picked up without restarting.
-    pub fn route<T>(mut self, path: impl Into<String>, target: T) -> Self
-    where
-        T: ToSocketAddrs + Clone + Send + Sync + 'static,
-    {
-        self.routes.insert(path.into(), Address::new(target));
-        self
+    pub fn route(mut self, pattern: impl Into<String>, target: impl Into<String>) -> Result<Self> {
+        self.router.insert(pattern, target)?;
+        Ok(self)
     }
 
     /// Set the default target for paths that don't match any route.
@@ -801,7 +805,7 @@ impl ProxyServerBuilder {
         let bindable = bindable.into_bindable()?;
         let listen_addr = bindable.local_addr()?;
 
-        if self.routes.is_empty() && self.default_target.is_none() {
+        if self.router.is_empty() && self.default_target.is_none() {
             return Err(Error::config(
                 "at least one route or a default_target is required",
             ));
@@ -831,7 +835,7 @@ impl ProxyServerBuilder {
             bindable,
             inner: Arc::new(ProxyServerInner {
                 listen_addr,
-                routes: self.routes,
+                router: self.router,
                 default_target: self.default_target,
                 tls_acceptor,
             }),
@@ -899,7 +903,7 @@ fn generate_self_signed_cert() -> Result<(Vec<CertificateDer<'static>>, PrivateK
 
 struct ProxyServerInner {
     listen_addr: SocketAddr,
-    routes: HashMap<String, Address>,
+    router: Router,
     default_target: Option<Address>,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
 }
@@ -1087,14 +1091,10 @@ where
     // Get the path and find the target
     let request_path = path.lock().unwrap().clone();
     let target = inner
-        .routes
-        .get(&request_path)
-        .or_else(|| {
-            // Try matching without trailing slash
-            let normalized = request_path.trim_end_matches('/');
-            inner.routes.get(normalized)
-        })
-        .or(inner.default_target.as_ref())
+        .router
+        .resolve(&request_path)
+        .map(Address::from)
+        .or_else(|| inner.default_target.clone())
         .ok_or_else(|| Error::no_route_found(request_path.clone()))?;
     let (mut ws_write, mut ws_read) = ws_stream.split();
 
@@ -1183,14 +1183,9 @@ where
     let request_path = path.lock().unwrap().clone();
     let target = {
         let cfg = config.read().await;
-        cfg.routes
-            .get(&request_path)
-            .or_else(|| {
-                let normalized = request_path.trim_end_matches('/');
-                cfg.routes.get(normalized)
-            })
-            .or(cfg.default_target.as_ref())
-            .cloned()
+        cfg.router
+            .resolve(&request_path)
+            .or_else(|| cfg.default_target.clone())
             .ok_or_else(|| Error::no_route_found(request_path.clone()))?
     };
 
