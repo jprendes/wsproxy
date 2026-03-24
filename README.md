@@ -106,6 +106,10 @@ Host myserver
 
 Now `ssh myserver` will tunnel through the WebSocket proxy.
 
+### Docker
+
+Run wsproxy in a container with automatic restart and startup on boot. See [docs/docker.md](docs/docker.md).
+
 ### Upstart
 
 For systems using Upstart (Ubuntu 14.04 and earlier), see [docs/upstart.md](docs/upstart.md).
