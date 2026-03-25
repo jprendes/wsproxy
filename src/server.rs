@@ -131,63 +131,6 @@ impl IntoBindable for (std::net::Ipv6Addr, u16) {
     }
 }
 
-/// A lazy address resolver that resolves the address when a connection is established.
-///
-/// This allows DNS changes to be picked up without restarting the server.
-#[derive(Clone)]
-pub struct Address {
-    resolver: Arc<dyn Fn() -> std::io::Result<SocketAddr> + Send + Sync>,
-}
-
-impl Address {
-    /// Create a new lazy address from anything that implements `ToSocketAddrs`.
-    ///
-    /// The address will be resolved each time `resolve()` is called.
-    pub fn new<T>(addr: T) -> Self
-    where
-        T: ToSocketAddrs + Clone + Send + Sync + 'static,
-    {
-        Address {
-            resolver: Arc::new(move || {
-                addr.clone().to_socket_addrs()?.next().ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::NotFound, "could not resolve address")
-                })
-            }),
-        }
-    }
-
-    /// Resolve the address.
-    ///
-    /// This performs DNS resolution if the address is a hostname.
-    pub fn resolve(&self) -> std::io::Result<SocketAddr> {
-        (self.resolver)()
-    }
-}
-
-impl std::fmt::Debug for Address {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Address").finish_non_exhaustive()
-    }
-}
-
-impl From<String> for Address {
-    fn from(s: String) -> Self {
-        Address::new(s)
-    }
-}
-
-impl From<&'static str> for Address {
-    fn from(s: &'static str) -> Self {
-        Address::new(s.to_string())
-    }
-}
-
-impl From<SocketAddr> for Address {
-    fn from(addr: SocketAddr) -> Self {
-        Address::new(addr)
-    }
-}
-
 /// TLS configuration for the server
 #[derive(Debug, Clone)]
 pub enum TlsConfig {
@@ -704,14 +647,14 @@ async fn run_server_loop(
 /// let server = ProxyServer::builder()
 ///     .default_target("127.0.0.1:22")
 ///     .tls("cert.pem", "key.pem")
-///     .bind("0.0.0.0:8443")?;
+///     .bind("0.0.0.0:8443")?;;
 /// # Ok(())
 /// # }
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct ProxyServerBuilder {
     router: Router,
-    default_target: Option<Address>,
+    default_target: Option<String>,
     tls_config: Option<TlsConfig>,
 }
 
@@ -739,13 +682,14 @@ impl ProxyServerBuilder {
 
     /// Set the default target for paths that don't match any route.
     ///
+    /// This is equivalent to adding catch-all routes for all paths.
+    /// The catch-all routes are added last (in `bind()`) to ensure
+    /// explicit routes always take precedence.
+    ///
     /// The target address is resolved when connections are established,
     /// allowing for DNS changes to be picked up without restarting.
-    pub fn default_target<T>(mut self, target: T) -> Self
-    where
-        T: ToSocketAddrs + Clone + Send + Sync + 'static,
-    {
-        self.default_target = Some(Address::new(target));
+    pub fn default_target(mut self, target: impl Into<String>) -> Self {
+        self.default_target = Some(target.into());
         self
     }
 
@@ -801,11 +745,18 @@ impl ProxyServerBuilder {
     /// # Errors
     ///
     /// Returns an error if neither routes nor a default target is configured.
-    pub fn bind(self, bindable: impl IntoBindable) -> Result<ProxyServer> {
+    pub fn bind(mut self, bindable: impl IntoBindable) -> Result<ProxyServer> {
         let bindable = bindable.into_bindable()?;
         let listen_addr = bindable.local_addr()?;
 
-        if self.router.is_empty() && self.default_target.is_none() {
+        // Add default_target as catch-all routes (last, so explicit routes take precedence)
+        if let Some(target) = self.default_target {
+            // Insert both root path and catch-all since matchit's {*path} requires at least one segment
+            self.router.insert("/", target.clone())?;
+            self.router.insert("/{*path}", target)?;
+        }
+
+        if self.router.is_empty() {
             return Err(Error::config(
                 "at least one route or a default_target is required",
             ));
@@ -836,7 +787,6 @@ impl ProxyServerBuilder {
             inner: Arc::new(ProxyServerInner {
                 listen_addr,
                 router: self.router,
-                default_target: self.default_target,
                 tls_acceptor,
             }),
         })
@@ -904,7 +854,6 @@ fn generate_self_signed_cert() -> Result<(Vec<CertificateDer<'static>>, PrivateK
 struct ProxyServerInner {
     listen_addr: SocketAddr,
     router: Router,
-    default_target: Option<Address>,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
 }
 
@@ -1109,13 +1058,14 @@ where
     let target = inner
         .router
         .resolve(&request_path)
-        .map(Address::from)
-        .or_else(|| inner.default_target.clone())
         .ok_or_else(|| Error::no_route_found(request_path.clone()))?;
     let (mut ws_write, mut ws_read) = ws_stream.split();
 
     // Connect to TCP target (resolve address at connection time)
-    let target_addr = target.resolve()?;
+    let target_addr = target
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| Error::config("could not resolve address"))?;
     let tcp_stream = TcpStream::connect(target_addr).await?;
     let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
 

@@ -170,13 +170,13 @@ async fn main() -> wsproxy::Result<()> {
 
     // Server with TLS (WSS)
     let secure_server = ProxyServer::builder()
-        .default_target("127.0.0.1:22")?
+        .default_target("127.0.0.1:22")
         .tls("cert.pem", "key.pem")
         .bind("0.0.0.0:8443")?;
 
     // Server with auto-generated self-signed certificate
     let dev_server = ProxyServer::builder()
-        .default_target("127.0.0.1:22")?
+        .default_target("127.0.0.1:22")
         .tls_self_signed()
         .bind("0.0.0.0:8443")?;
 

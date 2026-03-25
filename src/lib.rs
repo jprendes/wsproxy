@@ -62,4 +62,4 @@ pub use client::{ProxyClient, TlsOptions};
 pub use config::{ConfigChange, ConfigWatcher, ServerFileConfig};
 pub use error::{Error, Result};
 pub use router::Router;
-pub use server::{Address, Bindable, IntoBindable, ProxyServer, ProxyServerBuilder, TlsMode};
+pub use server::{Bindable, IntoBindable, ProxyServer, ProxyServerBuilder, TlsMode};
