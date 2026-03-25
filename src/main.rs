@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -81,9 +82,9 @@ enum Commands {
 /// Wait for Ctrl+C (SIGINT) to trigger graceful shutdown.
 /// This works on both Unix and Windows.
 async fn wait_for_shutdown() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to listen for Ctrl+C");
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        eprintln!("Failed to listen for Ctrl+C: {e}");
+    }
 }
 
 fn main() {
@@ -94,7 +95,7 @@ fn main() {
 }
 
 #[tokio::main]
-async fn run() -> wsproxy::Result<()> {
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -117,7 +118,7 @@ async fn run() -> wsproxy::Result<()> {
                 .await?;
             } else {
                 // CLI mode
-                let listen = listen.expect("listen is required when not using config");
+                let listen = listen.context("listen is required when not using config")?;
                 let tls = match (tls_cert, tls_key, tls_self_signed) {
                     (Some(cert), Some(key), false) => wsproxy::server::TlsMode::Files {
                         cert: cert.leak(),

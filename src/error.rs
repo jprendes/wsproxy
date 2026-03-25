@@ -1,6 +1,7 @@
 //! Error types for the wsproxy library.
 
 use std::backtrace::{Backtrace, BacktraceStatus};
+use std::sync::PoisonError;
 use std::{fmt, io};
 
 /// Result type alias using the library's Error type.
@@ -22,6 +23,8 @@ enum ErrorKind {
     NoRouteFound(String),
     /// Configuration error.
     Config(String),
+    /// Mutex was poisoned (another thread panicked while holding the lock).
+    MutexPoisoned,
 }
 
 impl Error {
@@ -37,6 +40,14 @@ impl Error {
     pub fn config(message: impl Into<String>) -> Self {
         Self {
             kind: ErrorKind::Config(message.into()),
+            backtrace: Backtrace::capture(),
+        }
+    }
+
+    /// Create a new MutexPoisoned error.
+    pub fn mutex_poisoned() -> Self {
+        Self {
+            kind: ErrorKind::MutexPoisoned,
             backtrace: Backtrace::capture(),
         }
     }
@@ -83,6 +94,7 @@ impl fmt::Display for Error {
             ErrorKind::WebSocket(e) => write!(f, "WebSocket error: {e}"),
             ErrorKind::NoRouteFound(path) => write!(f, "No route found for path: {path}"),
             ErrorKind::Config(msg) => write!(f, "Configuration error: {msg}"),
+            ErrorKind::MutexPoisoned => write!(f, "Mutex poisoned"),
         }
     }
 }
@@ -92,7 +104,7 @@ impl std::error::Error for Error {
         match &self.kind {
             ErrorKind::Io(e) => Some(e),
             ErrorKind::WebSocket(e) => Some(e),
-            ErrorKind::NoRouteFound(_) | ErrorKind::Config(_) => None,
+            ErrorKind::NoRouteFound(_) | ErrorKind::Config(_) | ErrorKind::MutexPoisoned => None,
         }
     }
 }
@@ -112,5 +124,11 @@ impl From<tokio_tungstenite::tungstenite::Error> for Error {
             kind: ErrorKind::WebSocket(err),
             backtrace: Backtrace::capture(),
         }
+    }
+}
+
+impl<T> From<PoisonError<T>> for Error {
+    fn from(_: PoisonError<T>) -> Self {
+        Self::mutex_poisoned()
     }
 }

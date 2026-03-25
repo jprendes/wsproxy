@@ -9,6 +9,7 @@ homepage = "https://github.com/jprendes/wsproxy"
 repository = "https://github.com/jprendes/wsproxy"
 
 [dependencies]
+anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 matchit = "0.8"

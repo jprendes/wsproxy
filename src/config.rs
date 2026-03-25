@@ -207,7 +207,16 @@ impl ConfigWatcher {
                 // Try to load new config
                 match ServerFileConfig::load(&path_clone) {
                     Ok(new_config) => {
-                        let old_config = current_clone.lock().unwrap();
+                        let old_config = match current_clone.lock() {
+                            Ok(guard) => guard,
+                            Err(e) => {
+                                let _ = tx_clone.blocking_send(ConfigChange::Error(format!(
+                                    "mutex poisoned: {}",
+                                    e
+                                )));
+                                return;
+                            }
+                        };
                         let change = if old_config.only_routing_changed(&new_config) {
                             ConfigChange::RoutingOnly(new_config.clone())
                         } else {
@@ -216,7 +225,16 @@ impl ConfigWatcher {
                         drop(old_config);
 
                         // Update current config
-                        *current_clone.lock().unwrap() = new_config;
+                        match current_clone.lock() {
+                            Ok(mut guard) => *guard = new_config,
+                            Err(e) => {
+                                let _ = tx_clone.blocking_send(ConfigChange::Error(format!(
+                                    "mutex poisoned: {}",
+                                    e
+                                )));
+                                return;
+                            }
+                        }
 
                         // Send notification (ignore if channel is full)
                         let _ = tx_clone.blocking_send(change);
@@ -252,22 +270,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_minimal_config() {
+    fn test_parse_minimal_config() -> Result<()> {
         let config = ServerFileConfig::parse(
             r#"
             listen = "0.0.0.0:8080"
             default_target = "127.0.0.1:22"
             "#,
-        )
-        .unwrap();
+        )?;
 
         assert_eq!(config.listen, "0.0.0.0:8080");
         assert_eq!(config.default_target, Some("127.0.0.1:22".to_string()));
         assert!(config.routes.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_parse_full_config() {
+    fn test_parse_full_config() -> Result<()> {
         let config = ServerFileConfig::parse(
             r#"
             listen = "0.0.0.0:8443"
@@ -281,8 +299,7 @@ mod tests {
             cert = "cert.pem"
             key = "key.pem"
             "#,
-        )
-        .unwrap();
+        )?;
 
         assert_eq!(config.listen, "0.0.0.0:8443");
         assert_eq!(config.routes.get("/ssh"), Some(&"127.0.0.1:22".to_string()));
@@ -291,10 +308,11 @@ mod tests {
             Some(&"127.0.0.1:5432".to_string())
         );
         assert!(config.has_tls());
+        Ok(())
     }
 
     #[test]
-    fn test_parse_self_signed_tls() {
+    fn test_parse_self_signed_tls() -> Result<()> {
         let config = ServerFileConfig::parse(
             r#"
             listen = "0.0.0.0:8443"
@@ -303,11 +321,11 @@ mod tests {
             [tls]
             self_signed = true
             "#,
-        )
-        .unwrap();
+        )?;
 
         assert!(config.tls.self_signed);
         assert!(config.has_tls());
+        Ok(())
     }
 
     #[test]
@@ -348,32 +366,30 @@ mod tests {
     }
 
     #[test]
-    fn test_only_routing_changed() {
+    fn test_only_routing_changed() -> Result<()> {
         let config1 = ServerFileConfig::parse(
             r#"
             listen = "0.0.0.0:8080"
             default_target = "127.0.0.1:22"
             "#,
-        )
-        .unwrap();
+        )?;
 
         let config2 = ServerFileConfig::parse(
             r#"
             listen = "0.0.0.0:8080"
             default_target = "127.0.0.1:23"
             "#,
-        )
-        .unwrap();
+        )?;
 
         let config3 = ServerFileConfig::parse(
             r#"
             listen = "0.0.0.0:9090"
             default_target = "127.0.0.1:22"
             "#,
-        )
-        .unwrap();
+        )?;
 
         assert!(config1.only_routing_changed(&config2));
         assert!(!config1.only_routing_changed(&config3));
+        Ok(())
     }
 }

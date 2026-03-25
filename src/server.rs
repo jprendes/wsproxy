@@ -1077,19 +1077,35 @@ where
     // Extract the path from the WebSocket handshake
     let path = Arc::new(std::sync::Mutex::new(String::new()));
     let path_clone = Arc::clone(&path);
+    let callback_error: Arc<std::sync::Mutex<Option<Error>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let callback_error_clone = Arc::clone(&callback_error);
 
     #[allow(clippy::result_large_err)] // the err variant is the error response
     let callback = move |req: &Request, response: Response| {
         let uri_path = req.uri().path().to_string();
-        *path_clone.lock().unwrap() = uri_path;
+        match path_clone.lock() {
+            Ok(mut guard) => *guard = uri_path,
+            Err(e) => {
+                // Store the error to check after handshake
+                if let Ok(mut err_guard) = callback_error_clone.lock() {
+                    *err_guard = Some(e.into());
+                }
+            }
+        }
         Ok(response)
     };
 
     // Accept WebSocket connection with header callback
     let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
 
+    // Check if callback encountered an error
+    if let Some(err) = callback_error.lock()?.take() {
+        return Err(err);
+    }
+
     // Get the path and find the target
-    let request_path = path.lock().unwrap().clone();
+    let request_path = path.lock()?.clone();
     let target = inner
         .router
         .resolve(&request_path)
@@ -1168,19 +1184,35 @@ where
     // Extract the path from the WebSocket handshake
     let path = Arc::new(std::sync::Mutex::new(String::new()));
     let path_clone = Arc::clone(&path);
+    let callback_error: Arc<std::sync::Mutex<Option<Error>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let callback_error_clone = Arc::clone(&callback_error);
 
     #[allow(clippy::result_large_err)]
     let callback = move |req: &Request, response: Response| {
         let uri_path = req.uri().path().to_string();
-        *path_clone.lock().unwrap() = uri_path;
+        match path_clone.lock() {
+            Ok(mut guard) => *guard = uri_path,
+            Err(e) => {
+                // Store the error to check after handshake
+                if let Ok(mut err_guard) = callback_error_clone.lock() {
+                    *err_guard = Some(e.into());
+                }
+            }
+        }
         Ok(response)
     };
 
     // Accept WebSocket connection with header callback
     let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
 
+    // Check if callback encountered an error
+    if let Some(err) = callback_error.lock()?.take() {
+        return Err(err);
+    }
+
     // Get the path and find the target (using current config)
-    let request_path = path.lock().unwrap().clone();
+    let request_path = path.lock()?.clone();
     let target = {
         let cfg = config.read().await;
         cfg.router
