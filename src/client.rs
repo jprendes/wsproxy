@@ -14,6 +14,18 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::error::{Error, Result};
 use crate::server::{Bindable, IntoBindable};
 
+#[derive(Clone, Copy)]
+pub(crate) enum Resumption {
+    Auto,
+    Required,
+    Disabled,
+}
+
+pub(crate) struct Connection {
+    pub socket: crate::resume::Socket,
+    pub resumable: bool,
+}
+
 /// TLS options for the client
 #[derive(Debug, Clone, Default)]
 pub struct TlsOptions {
@@ -69,6 +81,7 @@ where
 ///
 /// This is useful for SSH ProxyCommand integration. The tunnel connects to
 /// the WebSocket server and forwards data between stdin/stdout and the WebSocket.
+/// Resumption is negotiated automatically, with raw forwarding for legacy servers.
 ///
 /// # Arguments
 ///
@@ -84,40 +97,31 @@ where
 ///   HostName localhost
 /// ```
 pub async fn tunnel(server_url: &str, tls_options: &TlsOptions) -> Result<()> {
-    use tokio::io::{stdin, stdout};
-    // Connect to WebSocket server
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    tunnel_with_resumption(server_url, tls_options, Resumption::Auto).await
+}
 
-    let request = server_url.into_client_request()?;
-    let uri = request.uri();
-    let scheme = uri.scheme_str().unwrap_or("ws");
-    let host = uri
-        .host()
-        .ok_or_else(|| Error::config("missing host in URL"))?;
-    let port = uri
-        .port_u16()
-        .unwrap_or(if scheme == "wss" { 443 } else { 80 });
+/// Require a resumable SSH ProxyCommand tunnel, failing if the server cannot resume.
+pub async fn tunnel_resumable(server_url: &str, tls_options: &TlsOptions) -> Result<()> {
+    tunnel_with_resumption(server_url, tls_options, Resumption::Required).await
+}
 
-    let addr = format!("{}:{}", host, port);
-    let tcp_conn = TcpStream::connect(&addr).await?;
-
-    if scheme == "wss" {
-        // TLS connection
-        use tokio_rustls::rustls::pki_types::ServerName;
-
-        let config = build_tls_config(tls_options)?;
-
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-        let server_name = ServerName::try_from(host.to_string())
-            .map_err(|e| Error::config(format!("invalid server name: {}", e)))?;
-
-        let tls_stream = connector.connect(server_name, tcp_conn).await?;
-        let (ws_stream, _response) = tokio_tungstenite::client_async(request, tls_stream).await?;
-        forward_ws_stdio(ws_stream, stdin(), stdout()).await
+async fn tunnel_with_resumption(
+    server_url: &str,
+    tls_options: &TlsOptions,
+    mode: Resumption,
+) -> Result<()> {
+    let connection = connect(server_url, tls_options, mode).await?;
+    if connection.resumable {
+        crate::resume::client(
+            connection.socket,
+            server_url,
+            tls_options,
+            tokio::io::stdin(),
+            tokio::io::stdout(),
+        )
+        .await
     } else {
-        // Plain TCP connection
-        let (ws_stream, _response) = tokio_tungstenite::client_async(request, tcp_conn).await?;
-        forward_ws_stdio(ws_stream, stdin(), stdout()).await
+        forward_ws_stdio(connection.socket, tokio::io::stdin(), tokio::io::stdout()).await
     }
 }
 
@@ -129,6 +133,7 @@ struct ProxyClientInner {
 }
 
 /// A proxy client that forwards TCP connections through WebSocket.
+/// Automatically negotiates resumption when enabled by the server.
 ///
 /// # Example
 ///
@@ -149,6 +154,7 @@ struct ProxyClientInner {
 pub struct ProxyClient {
     bindable: Bindable,
     inner: Arc<ProxyClientInner>,
+    resumption: Resumption,
 }
 
 impl ProxyClient {
@@ -195,6 +201,7 @@ impl ProxyClient {
 
         Ok(Self {
             bindable,
+            resumption: Resumption::Auto,
             inner: Arc::new(ProxyClientInner {
                 listen_addr,
                 server_url: server_url.into(),
@@ -206,6 +213,17 @@ impl ProxyClient {
     /// Get the configured listen address.
     pub fn local_addr(&self) -> SocketAddr {
         self.inner.listen_addr
+    }
+
+    /// Require resumption when true, or force raw forwarding when false.
+    /// By default, clients automatically negotiate resumption with the server.
+    pub fn with_resumption(mut self, enabled: bool) -> Self {
+        self.resumption = if enabled {
+            Resumption::Required
+        } else {
+            Resumption::Disabled
+        };
+        self
     }
 
     /// Run the proxy client.
@@ -230,9 +248,12 @@ impl ProxyClient {
             let (stream, peer_addr) = listener.accept().await?;
             let server_url = self.inner.server_url.clone();
             let tls_options = self.inner.tls_options.clone();
+            let resumption = self.resumption;
 
             tokio::spawn(async move {
-                if let Err(e) = handle_tcp_connection(stream, &server_url, &tls_options).await {
+                if let Err(e) =
+                    handle_tcp_connection(stream, &server_url, &tls_options, resumption).await
+                {
                     eprintln!("Error handling connection from {}: {}", peer_addr, e);
                 }
             });
@@ -279,12 +300,13 @@ impl ProxyClient {
                     let (stream, peer_addr) = accept_result?;
                     let server_url = self.inner.server_url.clone();
                     let tls_options = self.inner.tls_options.clone();
+                    let resumption = self.resumption;
                     let conn_counter = Arc::clone(&active_connections);
 
                     conn_counter.fetch_add(1, Ordering::SeqCst);
 
                     tokio::spawn(async move {
-                        if let Err(e) = handle_tcp_connection(stream, &server_url, &tls_options).await {
+                        if let Err(e) = handle_tcp_connection(stream, &server_url, &tls_options, resumption).await {
                             eprintln!("Error handling connection from {}: {}", peer_addr, e);
                         }
                         conn_counter.fetch_sub(1, Ordering::SeqCst);
@@ -329,40 +351,86 @@ async fn handle_tcp_connection(
     tcp_stream: TcpStream,
     server_url: &str,
     tls_options: &TlsOptions,
+    resumption: Resumption,
 ) -> Result<()> {
-    // Connect to WebSocket server (supports both ws:// and wss://)
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let connection = connect(server_url, tls_options, resumption).await?;
+    if connection.resumable {
+        let (reader, writer) = tcp_stream.into_split();
+        return crate::resume::client(connection.socket, server_url, tls_options, reader, writer)
+            .await;
+    }
+    forward_ws_tcp(connection.socket, tcp_stream).await
+}
 
-    let request = server_url.into_client_request()?;
-    let uri = request.uri();
-    let scheme = uri.scheme_str().unwrap_or("ws");
-    let host = uri
-        .host()
-        .ok_or_else(|| Error::config("missing host in URL"))?;
-    let port = uri
-        .port_u16()
-        .unwrap_or(if scheme == "wss" { 443 } else { 80 });
+pub(crate) async fn connect(
+    server_url: &str,
+    tls_options: &TlsOptions,
+    mode: Resumption,
+) -> Result<Connection> {
+    let connection = async {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    let addr = format!("{}:{}", host, port);
-    let tcp_conn = TcpStream::connect(&addr).await?;
+        let mut request = server_url.into_client_request()?;
+        match mode {
+            Resumption::Required => {
+                request.headers_mut().insert(
+                    "sec-websocket-protocol",
+                    crate::resume::PROTOCOL.parse().expect("static header"),
+                );
+            }
+            Resumption::Auto => {
+                request.headers_mut().insert(
+                    crate::resume::CAPABILITY_HEADER,
+                    crate::resume::PROTOCOL.parse().expect("static header"),
+                );
+            }
+            Resumption::Disabled => {}
+        }
+        let uri = request.uri();
+        let scheme = uri.scheme_str().unwrap_or("ws");
+        let host = uri
+            .host()
+            .ok_or_else(|| Error::config("missing host in URL"))?;
+        let port = uri
+            .port_u16()
+            .unwrap_or(if scheme == "wss" { 443 } else { 80 });
 
-    if scheme == "wss" {
-        // TLS connection
-        use tokio_rustls::rustls::pki_types::ServerName;
+        let tcp_conn = TcpStream::connect((host, port)).await?;
 
-        let config = build_tls_config(tls_options)?;
+        let stream: Box<dyn crate::resume::Io> = if scheme == "wss" {
+            // TLS connection
+            use tokio_rustls::rustls::pki_types::ServerName;
 
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-        let server_name = ServerName::try_from(host.to_string())
-            .map_err(|e| Error::config(format!("invalid server name: {}", e)))?;
+            let config = build_tls_config(tls_options)?;
 
-        let tls_stream = connector.connect(server_name, tcp_conn).await?;
-        let (ws_stream, _response) = tokio_tungstenite::client_async(request, tls_stream).await?;
-        forward_ws_tcp(ws_stream, tcp_stream).await
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+            let server_name = ServerName::try_from(host.to_string())
+                .map_err(|e| Error::config(format!("invalid server name: {}", e)))?;
+
+            Box::new(connector.connect(server_name, tcp_conn).await?)
+        } else {
+            Box::new(tcp_conn)
+        };
+        let (socket, response) = tokio_tungstenite::client_async(request, stream).await?;
+        let header = match mode {
+            Resumption::Required => "sec-websocket-protocol",
+            Resumption::Auto => crate::resume::CAPABILITY_HEADER,
+            Resumption::Disabled => "",
+        };
+        let resumable = !matches!(mode, Resumption::Disabled)
+            && response.headers().get(header).and_then(|v| v.to_str().ok())
+                == Some(crate::resume::PROTOCOL);
+        if matches!(mode, Resumption::Required) && !resumable {
+            return Err(Error::rejected("server does not support resumable tunnels"));
+        }
+        Ok(Connection { socket, resumable })
+    };
+    if !matches!(mode, Resumption::Disabled) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), connection)
+            .await
+            .map_err(|_| Error::tunnel("WebSocket connection timed out"))?
     } else {
-        // Plain TCP connection
-        let (ws_stream, _response) = tokio_tungstenite::client_async(request, tcp_conn).await?;
-        forward_ws_tcp(ws_stream, tcp_stream).await
+        connection.await
     }
 }
 

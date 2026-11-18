@@ -23,11 +23,31 @@ enum ErrorKind {
     NoRouteFound(String),
     /// Configuration error.
     Config(String),
+    Tunnel(String),
+    Rejected(String),
     /// Mutex was poisoned (another thread panicked while holding the lock).
     MutexPoisoned,
 }
 
 impl Error {
+    pub(crate) fn rejected(message: impl Into<String>) -> Self {
+        Self {
+            kind: ErrorKind::Rejected(message.into()),
+            backtrace: Backtrace::capture(),
+        }
+    }
+
+    pub(crate) fn is_tunnel_rejection(&self) -> bool {
+        matches!(self.kind, ErrorKind::Rejected(_))
+    }
+
+    pub(crate) fn tunnel(message: impl Into<String>) -> Self {
+        Self {
+            kind: ErrorKind::Tunnel(message.into()),
+            backtrace: Backtrace::capture(),
+        }
+    }
+
     /// Create a new NoRouteFound error.
     pub fn no_route_found(path: impl Into<String>) -> Self {
         Self {
@@ -94,6 +114,8 @@ impl fmt::Display for Error {
             ErrorKind::WebSocket(e) => write!(f, "WebSocket error: {e}"),
             ErrorKind::NoRouteFound(path) => write!(f, "No route found for path: {path}"),
             ErrorKind::Config(msg) => write!(f, "Configuration error: {msg}"),
+            ErrorKind::Tunnel(msg) => write!(f, "Tunnel error: {msg}"),
+            ErrorKind::Rejected(msg) => write!(f, "Tunnel rejected: {msg}"),
             ErrorKind::MutexPoisoned => write!(f, "Mutex poisoned"),
         }
     }
@@ -104,7 +126,11 @@ impl std::error::Error for Error {
         match &self.kind {
             ErrorKind::Io(e) => Some(e),
             ErrorKind::WebSocket(e) => Some(e),
-            ErrorKind::NoRouteFound(_) | ErrorKind::Config(_) | ErrorKind::MutexPoisoned => None,
+            ErrorKind::NoRouteFound(_)
+            | ErrorKind::Config(_)
+            | ErrorKind::Tunnel(_)
+            | ErrorKind::Rejected(_)
+            | ErrorKind::MutexPoisoned => None,
         }
     }
 }

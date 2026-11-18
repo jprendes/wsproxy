@@ -12,6 +12,7 @@ repository = "https://github.com/jprendes/wsproxy"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
+getrandom = "0.2"
 matchit = "0.8"
 notify = "8"
 rcgen = "0.13"

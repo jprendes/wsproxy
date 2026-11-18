@@ -12,7 +12,8 @@
 //! ## ProxyServer
 //!
 //! The server listens for WebSocket connections and forwards data to a TCP target.
-//! Each WebSocket connection results in a new TCP connection to the target.
+//! Each new tunnel opens a TCP connection; resumable tunnels retain it across
+//! WebSocket reconnections.
 //!
 //! ## ProxyClient
 //!
@@ -55,6 +56,7 @@
 pub mod client;
 pub mod config;
 mod error;
+mod resume;
 mod router;
 pub mod server;
 

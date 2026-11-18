@@ -53,6 +53,9 @@ pub struct ServerFileConfig {
     /// TLS configuration
     #[serde(default)]
     pub tls: TlsFileConfig,
+    /// Seconds to retain disconnected resumable tunnels. Zero disables resumption.
+    #[serde(default)]
+    pub reconnect_window_secs: u32,
 }
 
 impl ServerFileConfig {
@@ -106,7 +109,7 @@ impl ServerFileConfig {
         self.tls.self_signed || self.tls.cert.is_some()
     }
 
-    /// Check if only routing configuration changed (not listen address or TLS)
+    /// Check if settings can be hot-reloaded (everything except listen/TLS).
     pub fn only_routing_changed(&self, other: &Self) -> bool {
         self.listen == other.listen && self.tls == other.tls
     }
@@ -126,6 +129,7 @@ pub struct ResolvedConfig {
     pub listen_addr: SocketAddr,
     pub default_target: Option<String>,
     pub router: Router,
+    pub reconnect_window_secs: u32,
 }
 
 impl ResolvedConfig {
@@ -145,6 +149,7 @@ impl ResolvedConfig {
             listen_addr,
             default_target: config.default_target.clone(),
             router,
+            reconnect_window_secs: config.reconnect_window_secs,
         })
     }
 }
@@ -161,7 +166,7 @@ pub fn create_shared_config(config: &ServerFileConfig) -> Result<SharedRoutingCo
 /// Configuration change notification
 #[derive(Debug, Clone)]
 pub enum ConfigChange {
-    /// Only routing changed (routes/default_target) - can hot-reload
+    /// Routing or reconnect window changed - can hot-reload
     RoutingOnly(ServerFileConfig),
     /// Full restart required (listen address or TLS changed)
     FullRestart(ServerFileConfig),
@@ -268,6 +273,25 @@ impl ConfigWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_window_is_optional_validated_and_hot_reloadable() -> Result<()> {
+        let base = "listen = '127.0.0.1:8080'\ndefault_target = '127.0.0.1:22'\n";
+        let disabled = ServerFileConfig::parse(base)?;
+        assert_eq!(disabled.reconnect_window_secs, 0);
+        let enabled = ServerFileConfig::parse(&format!("{base}reconnect_window_secs = 120"))?;
+        assert_eq!(
+            ResolvedConfig::from_file_config(&enabled)?.reconnect_window_secs,
+            120
+        );
+        assert!(disabled.only_routing_changed(&enabled));
+        for value in ["-1", "1.5", "4294967296", "'unlimited'"] {
+            assert!(
+                ServerFileConfig::parse(&format!("{base}reconnect_window_secs = {value}")).is_err()
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_parse_minimal_config() -> Result<()> {

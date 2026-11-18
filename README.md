@@ -106,6 +106,73 @@ Host myserver
 
 Now `ssh myserver` will tunnel through the WebSocket proxy.
 
+### Automatic Reconnection
+
+Resumable tunnels preserve the **existing SSH connection** across temporary
+network failures. Updated clients automatically negotiate resumption when the
+server enables it, and use raw forwarding with older or disabled servers.
+
+Enable it in the server's TOML file (at the top level, before any tables):
+
+```toml
+listen = "0.0.0.0:8443"
+default_target = "127.0.0.1:22"
+reconnect_window_secs = 120
+
+[tls]
+cert = "cert.pem"
+key = "key.pem"
+```
+
+Your existing SSH configuration works without additional client flags:
+
+```text
+Host myserver
+    ProxyCommand wsproxy tunnel --server wss://proxy:8443/ssh
+    User myuser
+```
+
+Or in TCP listener mode:
+
+```bash
+wsproxy client --listen 127.0.0.1:2222 --server wss://proxy:8443/ssh
+```
+
+The client automatically uses the server's reconnect window; no matching client
+timeout is needed. During an outage, SSH pauses rather than disconnecting.
+Reconnection uses exponential backoff with jitter. Heartbeats run every 5 seconds
+and detect an unresponsive peer after approximately 15 seconds; individual
+connection/handshake/send operations time out after 10 seconds. The reconnect
+window starts when a disconnect is detected.
+
+- `reconnect_window_secs` defaults to `0` (disabled). It can be hot-reloaded for
+  **new sessions**; existing sessions retain their original window, including if
+  resumption is subsequently disabled.
+- Old clients continue to work unchanged with updated servers, without a
+  reconnect window. Updated clients negotiate via HTTP upgrade headers, before
+  sending application data; an older server receives no protocol probe bytes
+  and needs no extra connection.
+- `--resume` is optional: it **requires** resumption and fails explicitly against
+  a server that does not support or enable it. Automatic raw fallback is only
+  allowed when first connecting; an established resumable session never falls
+  back to a replacement TCP connection.
+- Each direction retains at most 1 MiB of unacknowledged TCP data and applies
+  backpressure when full. Offsets and acknowledgements prevent lost or duplicate
+  bytes after reconnection. TCP half-closes are preserved.
+- The server limits resumable sessions to 1024, including disconnected sessions.
+  Expired sessions are closed and removed.
+- Use **WSS with certificate verification**: resume tokens grant access to the
+  existing tunnel. Do not expose a plain WS connection over an untrusted network.
+- Resumption requires both proxy processes and the original backend TCP
+  connection to stay alive. With multiple server instances, reconnects must reach
+  the same instance. Process/container restarts and backend/SSH keepalive timeouts
+  cannot be recovered; configure SSH timeouts to tolerate your intended outages.
+- In the library, enable the server with
+  `ProxyServer::builder().reconnect_window_secs(120)`. `ProxyClient::bind(...)`
+  and `client::tunnel(...)` negotiate automatically. Use
+  `.with_resumption(true)` or `client::tunnel_resumable(...)` to require
+  resumption, or `.with_resumption(false)` to force raw TCP forwarding.
+
 ### Docker
 
 Run wsproxy in a container with automatic restart and startup on boot. See [docs/docker.md](docs/docker.md).
@@ -150,6 +217,7 @@ Hostnames are resolved using DNS when each connection is established, allowing D
 **Hot-reload behavior:**
 
 - **Routes and default_target changes**: Applied instantly. Existing connections continue uninterrupted; new connections use the updated routing.
+- **Reconnect window changes**: Applied to new resumable sessions. Existing sessions keep their original window and backend, even if routes change.
 - **Listen address or TLS changes**: Server automatically restarts. Existing connections continue until they complete naturally.
 - **Invalid configuration**: If the config file has syntax errors or invalid values, the error is logged and the server continues running with the previous valid configuration. Existing connections are not affected.
 

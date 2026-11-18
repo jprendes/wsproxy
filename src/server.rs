@@ -13,7 +13,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 
 use crate::config::{ConfigChange, ConfigWatcher, ResolvedConfig, ServerFileConfig};
 use crate::error::{Error, Result};
@@ -293,6 +292,7 @@ where
 /// ```
 pub async fn run_with_config(config_path: impl AsRef<Path>) -> Result<()> {
     let config_path = config_path.as_ref();
+    let sessions = crate::resume::Registry::default();
 
     loop {
         // Load initial config
@@ -327,8 +327,14 @@ pub async fn run_with_config(config_path: impl AsRef<Path>) -> Result<()> {
         let listener = TcpListener::bind(&config.listen).await?;
 
         // Run the server with hot-reload support
-        let restart_needed =
-            run_server_loop(listener, tls_acceptor, shared_config, &mut watcher).await?;
+        let restart_needed = run_server_loop(
+            listener,
+            tls_acceptor,
+            shared_config,
+            &mut watcher,
+            sessions.clone(),
+        )
+        .await?;
 
         if !restart_needed {
             break;
@@ -358,6 +364,7 @@ where
     use tokio::sync::Notify;
 
     let config_path = config_path.as_ref();
+    let sessions = crate::resume::Registry::default();
 
     // Shared state for connection tracking
     let active_connections = Arc::new(AtomicUsize::new(0));
@@ -407,6 +414,7 @@ where
             &mut shutdown,
             Arc::clone(&active_connections),
             Arc::clone(&shutdown_notify),
+            sessions.clone(),
         )
         .await?;
 
@@ -447,6 +455,7 @@ enum ServerLoopResult {
     Shutdown,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_server_loop_with_shutdown<F>(
     listener: TcpListener,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
@@ -455,6 +464,7 @@ async fn run_server_loop_with_shutdown<F>(
     shutdown: &mut std::pin::Pin<&mut F>,
     active_connections: Arc<std::sync::atomic::AtomicUsize>,
     shutdown_notify: Arc<tokio::sync::Notify>,
+    sessions: crate::resume::Registry,
 ) -> Result<ServerLoopResult>
 where
     F: std::future::Future<Output = ()>,
@@ -476,13 +486,14 @@ where
                 let tls = tls_acceptor.clone();
                 let conn_count = Arc::clone(&active_connections);
                 let notify = Arc::clone(&shutdown_notify);
+                let sessions = sessions.clone();
 
                 conn_count.fetch_add(1, Ordering::SeqCst);
 
                 tokio::spawn(async move {
                     let result = if let Some(ref tls_acceptor) = tls {
                         match tls_acceptor.accept(stream).await {
-                            Ok(tls_stream) => handle_ws_connection_shared(tls_stream, config).await,
+                            Ok(tls_stream) => handle_ws_connection_shared(tls_stream, config, sessions).await,
                             Err(e) => {
                                 eprintln!("TLS handshake failed from {}: {}", peer_addr, e);
                                 conn_count.fetch_sub(1, Ordering::SeqCst);
@@ -491,7 +502,7 @@ where
                             }
                         }
                     } else {
-                        handle_ws_connection_shared(stream, config).await
+                        handle_ws_connection_shared(stream, config, sessions).await
                     };
 
                     if let Err(e) = result {
@@ -512,7 +523,7 @@ where
                             Ok(resolved) => {
                                 let mut config = shared_config.write().await;
                                 *config = resolved;
-                                eprintln!("Configuration reloaded (routing updated)");
+                                eprintln!("Configuration reloaded (routing and reconnect window updated)");
                             }
                             Err(e) => {
                                 eprintln!("Failed to apply config: {}", e);
@@ -562,6 +573,7 @@ async fn run_server_loop(
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
     shared_config: Arc<RwLock<ResolvedConfig>>,
     watcher: &mut ConfigWatcher,
+    sessions: crate::resume::Registry,
 ) -> Result<bool> {
     loop {
         tokio::select! {
@@ -570,18 +582,19 @@ async fn run_server_loop(
                 let (stream, peer_addr) = accept_result?;
                 let config = Arc::clone(&shared_config);
                 let tls = tls_acceptor.clone();
+                let sessions = sessions.clone();
 
                 tokio::spawn(async move {
                     let result = if let Some(ref tls_acceptor) = tls {
                         match tls_acceptor.accept(stream).await {
-                            Ok(tls_stream) => handle_ws_connection_shared(tls_stream, config).await,
+                            Ok(tls_stream) => handle_ws_connection_shared(tls_stream, config, sessions).await,
                             Err(e) => {
                                 eprintln!("TLS handshake failed from {}: {}", peer_addr, e);
                                 return;
                             }
                         }
                     } else {
-                        handle_ws_connection_shared(stream, config).await
+                        handle_ws_connection_shared(stream, config, sessions).await
                     };
 
                     if let Err(e) = result {
@@ -599,7 +612,7 @@ async fn run_server_loop(
                             Ok(resolved) => {
                                 let mut config = shared_config.write().await;
                                 *config = resolved;
-                                eprintln!("Configuration reloaded (routing updated)");
+                                eprintln!("Configuration reloaded (routing and reconnect window updated)");
                             }
                             Err(e) => {
                                 eprintln!("Failed to apply config: {}", e);
@@ -656,9 +669,17 @@ pub struct ProxyServerBuilder {
     router: Router,
     default_target: Option<String>,
     tls_config: Option<TlsConfig>,
+    reconnect_window_secs: u32,
 }
 
 impl ProxyServerBuilder {
+    /// Enable resumable tunnels for this many seconds after a disconnect.
+    /// Zero (the default) disables resumption; raw forwarding remains available.
+    pub fn reconnect_window_secs(mut self, seconds: u32) -> Self {
+        self.reconnect_window_secs = seconds;
+        self
+    }
+
     /// Create a new builder with default values.
     pub fn new() -> Self {
         Self::default()
@@ -788,6 +809,8 @@ impl ProxyServerBuilder {
                 listen_addr,
                 router: self.router,
                 tls_acceptor,
+                reconnect_window_secs: self.reconnect_window_secs,
+                sessions: crate::resume::Registry::default(),
             }),
         })
     }
@@ -855,6 +878,8 @@ struct ProxyServerInner {
     listen_addr: SocketAddr,
     router: Router,
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
+    reconnect_window_secs: u32,
+    sessions: crate::resume::Registry,
 }
 
 /// A WebSocket proxy server that forwards WebSocket connections to TCP.
@@ -1021,44 +1046,56 @@ impl ProxyServer {
 
 async fn handle_ws_connection<S>(stream: S, inner: &ProxyServerInner) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    // Extract the path from the WebSocket handshake
-    let path = Arc::new(std::sync::Mutex::new(String::new()));
-    let path_clone = Arc::clone(&path);
-    let callback_error: Arc<std::sync::Mutex<Option<Error>>> =
-        Arc::new(std::sync::Mutex::new(None));
-    let callback_error_clone = Arc::clone(&callback_error);
-
-    #[allow(clippy::result_large_err)] // the err variant is the error response
-    let callback = move |req: &Request, response: Response| {
-        let uri_path = req.uri().path().to_string();
-        match path_clone.lock() {
-            Ok(mut guard) => *guard = uri_path,
-            Err(e) => {
-                // Store the error to check after handshake
-                if let Ok(mut err_guard) = callback_error_clone.lock() {
-                    *err_guard = Some(e.into());
-                }
-            }
-        }
-        Ok(response)
-    };
-
-    // Accept WebSocket connection with header callback
-    let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
-
-    // Check if callback encountered an error
-    if let Some(err) = callback_error.lock()?.take() {
-        return Err(err);
+    let (ws_stream, request_path, resumable) =
+        crate::resume::accept(stream, inner.reconnect_window_secs > 0).await?;
+    let target = inner.router.resolve(&request_path);
+    if resumable {
+        return crate::resume::serve(
+            ws_stream,
+            request_path,
+            target,
+            std::time::Duration::from_secs(u64::from(inner.reconnect_window_secs)),
+            inner.sessions.clone(),
+        )
+        .await;
     }
+    let target = target.ok_or_else(|| Error::no_route_found(request_path))?;
+    forward_ws_target(ws_stream, &target).await
+}
 
-    // Get the path and find the target
-    let request_path = path.lock()?.clone();
-    let target = inner
+async fn handle_ws_connection_shared<S>(
+    stream: S,
+    config: Arc<RwLock<ResolvedConfig>>,
+    sessions: crate::resume::Registry,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let window = config.read().await.reconnect_window_secs;
+    let (ws_stream, request_path, resumable) = crate::resume::accept(stream, window > 0).await?;
+    let cfg = config.read().await;
+    let target = cfg
         .router
         .resolve(&request_path)
-        .ok_or_else(|| Error::no_route_found(request_path.clone()))?;
+        .or_else(|| cfg.default_target.clone());
+    drop(cfg);
+    if resumable {
+        return crate::resume::serve(
+            ws_stream,
+            request_path,
+            target,
+            std::time::Duration::from_secs(u64::from(window)),
+            sessions,
+        )
+        .await;
+    }
+    let target = target.ok_or_else(|| Error::no_route_found(request_path))?;
+    forward_ws_target(ws_stream, &target).await
+}
+
+async fn forward_ws_target(ws_stream: crate::resume::Socket, target: &str) -> Result<()> {
     let (mut ws_write, mut ws_read) = ws_stream.split();
 
     // Connect to TCP target (resolve address at connection time)
@@ -1116,108 +1153,6 @@ where
     };
 
     // Run both directions concurrently
-    tokio::select! {
-        result = ws_to_tcp => result?,
-        result = tcp_to_ws => result?,
-    }
-
-    Ok(())
-}
-
-async fn handle_ws_connection_shared<S>(
-    stream: S,
-    config: Arc<RwLock<ResolvedConfig>>,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    // Extract the path from the WebSocket handshake
-    let path = Arc::new(std::sync::Mutex::new(String::new()));
-    let path_clone = Arc::clone(&path);
-    let callback_error: Arc<std::sync::Mutex<Option<Error>>> =
-        Arc::new(std::sync::Mutex::new(None));
-    let callback_error_clone = Arc::clone(&callback_error);
-
-    #[allow(clippy::result_large_err)]
-    let callback = move |req: &Request, response: Response| {
-        let uri_path = req.uri().path().to_string();
-        match path_clone.lock() {
-            Ok(mut guard) => *guard = uri_path,
-            Err(e) => {
-                // Store the error to check after handshake
-                if let Ok(mut err_guard) = callback_error_clone.lock() {
-                    *err_guard = Some(e.into());
-                }
-            }
-        }
-        Ok(response)
-    };
-
-    // Accept WebSocket connection with header callback
-    let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
-
-    // Check if callback encountered an error
-    if let Some(err) = callback_error.lock()?.take() {
-        return Err(err);
-    }
-
-    // Get the path and find the target (using current config)
-    let request_path = path.lock()?.clone();
-    let target = {
-        let cfg = config.read().await;
-        cfg.router
-            .resolve(&request_path)
-            .or_else(|| cfg.default_target.clone())
-            .ok_or_else(|| Error::no_route_found(request_path.clone()))?
-    };
-
-    let (mut ws_write, mut ws_read) = ws_stream.split();
-
-    // Connect to TCP target (resolve address at connection time)
-    let target_addr = target
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| Error::config("could not resolve address"))?;
-    let tcp_stream = TcpStream::connect(target_addr).await?;
-    let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
-
-    // Forward WebSocket -> TCP
-    let ws_to_tcp = async {
-        while let Some(msg) = ws_read.next().await {
-            match msg {
-                Ok(Message::Binary(data)) => {
-                    tcp_write.write_all(&data).await?;
-                }
-                Ok(Message::Text(text)) => {
-                    tcp_write.write_all(text.as_bytes()).await?;
-                }
-                Ok(Message::Close(_)) => {
-                    break;
-                }
-                Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {}
-                Err(e) => {
-                    return Err(e.into());
-                }
-            }
-        }
-        Ok::<_, Error>(())
-    };
-
-    // Forward TCP -> WebSocket
-    let tcp_to_ws = async {
-        let mut buf = vec![0u8; 8192];
-        loop {
-            let n = tcp_read.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            ws_write
-                .send(Message::Binary(buf[..n].to_vec().into()))
-                .await?;
-        }
-        Ok::<_, Error>(())
-    };
-
     tokio::select! {
         result = ws_to_tcp => result?,
         result = tcp_to_ws => result?,

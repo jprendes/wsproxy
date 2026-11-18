@@ -45,6 +45,10 @@ enum Commands {
 
     /// Run the proxy client (TCP -> WebSocket)
     Client {
+        /// Require resumption instead of auto-negotiating with raw fallback
+        #[arg(long)]
+        resume: bool,
+
         /// Address to listen for TCP connections (e.g., "127.0.0.1:2222")
         #[arg(short, long)]
         listen: String,
@@ -65,6 +69,10 @@ enum Commands {
     /// Run a single tunnel connection (stdin/stdout -> WebSocket)
     /// Useful for SSH ProxyCommand
     Tunnel {
+        /// Require resumption instead of auto-negotiating with raw fallback
+        #[arg(long)]
+        resume: bool,
+
         /// WebSocket server URL to connect to (e.g., "ws://server:8080/ssh" or "wss://server:8080/ssh")
         #[arg(short, long)]
         server: String,
@@ -141,6 +149,7 @@ async fn run() -> Result<()> {
         }
 
         Commands::Client {
+            resume,
             listen,
             server,
             insecure,
@@ -151,17 +160,19 @@ async fn run() -> Result<()> {
                 ca_cert_path: tls_ca_cert,
             };
 
-            wsproxy::client::run_until_shutdown(
-                &listen,
-                &server,
-                &tls_options,
-                wait_for_shutdown(),
-                std::time::Duration::from_secs(30),
-            )
-            .await?;
+            let client = wsproxy::ProxyClient::bind(&listen[..], server, tls_options)?;
+            let client = if resume {
+                client.with_resumption(true)
+            } else {
+                client
+            };
+            client
+                .run_until_shutdown(wait_for_shutdown(), std::time::Duration::from_secs(30))
+                .await?;
         }
 
         Commands::Tunnel {
+            resume,
             server,
             insecure,
             tls_ca_cert,
@@ -171,7 +182,11 @@ async fn run() -> Result<()> {
                 ca_cert_path: tls_ca_cert,
             };
 
-            wsproxy::client::tunnel(&server, &tls_options).await?;
+            if resume {
+                wsproxy::client::tunnel_resumable(&server, &tls_options).await?;
+            } else {
+                wsproxy::client::tunnel(&server, &tls_options).await?;
+            }
         }
     }
 
