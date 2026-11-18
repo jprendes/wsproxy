@@ -14,7 +14,7 @@ use crate::error::{Error, Result};
 /// - Pattern `/ssh/{host}` with target `{host}:22` → `/ssh/myserver` resolves to `myserver:22`
 #[derive(Clone)]
 pub struct Router {
-    inner: Arc<matchit::Router<String>>,
+    inner: Arc<matchit::Router<(String, String)>>,
     count: usize,
 }
 
@@ -36,7 +36,7 @@ impl Router {
         let target = target.into();
         let router = Arc::make_mut(&mut self.inner);
         router
-            .insert(pattern.clone(), target)
+            .insert(pattern.clone(), (pattern.clone(), target))
             .map_err(|e| Error::config(format!("invalid route pattern '{}': {}", pattern, e)))?;
         self.count += 1;
         Ok(())
@@ -46,9 +46,16 @@ impl Router {
     ///
     /// Returns `None` if no route matches.
     pub fn resolve(&self, path: &str) -> Option<String> {
+        self.resolve_with_pattern(path).map(|(_, target)| target)
+    }
+
+    pub(crate) fn resolve_with_pattern(&self, path: &str) -> Option<(&str, String)> {
         // Try exact match first
         if let Ok(matched) = self.inner.at(path) {
-            return Some(substitute_params(matched.value, matched.params));
+            return Some((
+                &matched.value.0,
+                substitute_params(&matched.value.1, matched.params),
+            ));
         }
 
         // Try without trailing slash
@@ -56,7 +63,10 @@ impl Router {
         if normalized != path
             && let Ok(matched) = self.inner.at(normalized)
         {
-            return Some(substitute_params(matched.value, matched.params));
+            return Some((
+                &matched.value.0,
+                substitute_params(&matched.value.1, matched.params),
+            ));
         }
 
         None

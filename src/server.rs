@@ -1048,15 +1048,15 @@ async fn handle_ws_connection<S>(stream: S, inner: &ProxyServerInner) -> Result<
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (ws_stream, request_path, resumable) =
-        crate::resume::accept(stream, inner.reconnect_window_secs > 0).await?;
+    let (ws_stream, request_path, resumable, window) =
+        crate::resume::accept(stream, |_| inner.reconnect_window_secs).await?;
     let target = inner.router.resolve(&request_path);
     if resumable {
         return crate::resume::serve(
             ws_stream,
             request_path,
             target,
-            std::time::Duration::from_secs(u64::from(inner.reconnect_window_secs)),
+            std::time::Duration::from_secs(u64::from(window)),
             inner.sessions.clone(),
         )
         .await;
@@ -1073,14 +1073,14 @@ async fn handle_ws_connection_shared<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let window = config.read().await.reconnect_window_secs;
-    let (ws_stream, request_path, resumable) = crate::resume::accept(stream, window > 0).await?;
-    let cfg = config.read().await;
-    let target = cfg
-        .router
-        .resolve(&request_path)
-        .or_else(|| cfg.default_target.clone());
-    drop(cfg);
+    let cfg = config.read().await.clone();
+    let mut target = None;
+    let (ws_stream, request_path, resumable, window) = crate::resume::accept(stream, |path| {
+        let (resolved, window) = cfg.resolve(path);
+        target = resolved;
+        window
+    })
+    .await?;
     if resumable {
         return crate::resume::serve(
             ws_stream,

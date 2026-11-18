@@ -60,15 +60,17 @@ struct Attachment {
     done: oneshot::Sender<()>,
 }
 
-pub(crate) async fn accept<S: Io + 'static>(
+pub(crate) async fn accept<S: Io + 'static, F: FnOnce(&str) -> u32 + Unpin>(
     stream: S,
-    enabled: bool,
-) -> Result<(Socket, String, bool)> {
+    window_for_path: F,
+) -> Result<(Socket, String, bool, u32)> {
     let mut path = String::new();
     let mut resumable = false;
+    let mut window = 0;
     #[allow(clippy::result_large_err)]
     let callback = |request: &Request, mut response: Response| {
         path = request.uri().path().to_owned();
+        window = window_for_path(&path);
         resumable = request
             .headers()
             .get("sec-websocket-protocol")
@@ -79,7 +81,7 @@ pub(crate) async fn accept<S: Io + 'static>(
                 "sec-websocket-protocol",
                 PROTOCOL.parse().expect("static header"),
             );
-        } else if enabled
+        } else if window > 0
             && request
                 .headers()
                 .get(CAPABILITY_HEADER)
@@ -95,7 +97,7 @@ pub(crate) async fn accept<S: Io + 'static>(
     };
     let stream: Box<dyn Io> = Box::new(stream);
     let socket = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
-    Ok((socket, path, resumable))
+    Ok((socket, path, resumable, window))
 }
 
 async fn send(socket: &mut Socket, message: Message) -> Result<()> {

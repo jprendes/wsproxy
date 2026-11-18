@@ -10,6 +10,74 @@ use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use wsproxy::{ProxyClient, ProxyServer, TlsOptions};
 
+#[tokio::test]
+async fn negotiated_windows_use_route_patterns_and_disabled_routes_stay_raw() -> Result<()> {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    timeout(Duration::from_secs(8), async {
+        let mut tasks: JoinSet<Result<()>> = JoinSet::new();
+        let backend = TcpListener::bind("127.0.0.1:0").await?;
+        let target = backend.local_addr()?;
+        tasks.spawn(async move {
+            let mut connections = JoinSet::new();
+            loop {
+                let (stream, _) = backend.accept().await?;
+                connections.spawn(async move {
+                    let (mut reader, mut writer) = stream.into_split();
+                    tokio::io::copy(&mut reader, &mut writer).await
+                });
+            }
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        drop(listener);
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("server.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "listen = '{addr}'\ndefault_target = '{target}'\nreconnect_window = 600\n\
+             [routes]\n'/ssh/{{host}}' = '{target}'\n'/raw' = '{target}'\n\
+             [reconnect_windows]\n'/ssh/{{host}}' = 120\n'/raw' = 0\n"
+            ),
+        )?;
+        tasks.spawn(async move { Ok(wsproxy::server::run_with_config(path).await?) });
+        loop {
+            if TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        for (route, window) in [("/ssh/example/", 120u64), ("/fallback", 600), ("/raw", 0)] {
+            let mut request = format!("ws://{addr}{route}").into_client_request()?;
+            request
+                .headers_mut()
+                .insert("x-wsproxy-protocol", "wsproxy.resume.v1".parse()?);
+            let (mut socket, response) = tokio_tungstenite::connect_async(request).await?;
+            if window == 0 {
+                assert!(response.headers().get("x-wsproxy-protocol").is_none());
+                socket.send(Message::Binary(b"raw".to_vec().into())).await?;
+                let message = socket.next().await.unwrap()?;
+                assert_eq!(message.into_data(), b"raw".as_slice());
+            } else {
+                assert_eq!(
+                    response.headers()["x-wsproxy-protocol"],
+                    "wsproxy.resume.v1"
+                );
+                socket.send(Message::Binary(vec![0].into())).await?;
+                let ready = socket.next().await.unwrap()?.into_data();
+                assert_eq!(ready.len(), 49);
+                assert_eq!(ready[0], 2);
+                assert_eq!(u64::from_be_bytes(ready[33..41].try_into()?), window);
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?
+}
+
 struct Tunnel {
     port: u16,
     url: String,

@@ -117,7 +117,7 @@ Enable it in the server's TOML file (at the top level, before any tables):
 ```toml
 listen = "0.0.0.0:8443"
 default_target = "127.0.0.1:22"
-reconnect_window_secs = 120
+reconnect_window = 120
 
 [tls]
 cert = "cert.pem"
@@ -145,7 +145,9 @@ and detect an unresponsive peer after approximately 15 seconds; individual
 connection/handshake/send operations time out after 10 seconds. The reconnect
 window starts when a disconnect is detected.
 
-- `reconnect_window_secs` defaults to `0` (disabled). It can be hot-reloaded for
+- `reconnect_window` is an integer number of **seconds**, defaulting to `0`
+  (disabled). The old name `reconnect_window_secs` remains accepted as an alias;
+  do not specify both names. It can be hot-reloaded for
   **new sessions**; existing sessions retain their original window, including if
   resumption is subsequently disabled.
 - Old clients continue to work unchanged with updated servers, without a
@@ -172,6 +174,39 @@ window starts when a disconnect is detected.
   and `client::tunnel(...)` negotiate automatically. Use
   `.with_resumption(true)` or `client::tunnel_resumable(...)` to require
   resumption, or `.with_resumption(false)` to force raw TCP forwarding.
+
+#### Per-route reconnect windows
+
+Use optional overrides while keeping a global default:
+
+```toml
+listen = "0.0.0.0:8022"
+reconnect_window = 600
+
+[routes]
+"/ssh/{host}" = "{host}:22"
+"/gringotts" = "localhost:22"
+"/db" = "localhost:5432"
+
+[reconnect_windows]
+"/ssh/{host}" = 1200
+"/db" = 0
+```
+
+The override key must exactly match a configured route **pattern**, not an
+individual requested URL. Unknown keys and invalid values are rejected.
+Here, `/ssh/cube` gets 20 minutes, `/gringotts` inherits 10 minutes, and `/db`
+uses raw forwarding without resumption. A more-specific route without an override
+inherits the global value, not an override on a less-specific pattern.
+Unmatched paths served by `default_target` also use the global value.
+Overrides can enable resumption even when the global value is `0`.
+Trailing-slash normalization follows the same rules as routing.
+
+Negotiation selects the route's window before any application data is sent.
+Hot reloads affect new sessions only; existing sessions retain their original
+backend and window, including when a route is changed, removed, or disabled.
+The Rust builder's `reconnect_window_secs(...)` method retains its explicit unit
+name; per-route overrides are configured through TOML.
 
 ### Docker
 

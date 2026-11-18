@@ -54,8 +54,11 @@ pub struct ServerFileConfig {
     #[serde(default)]
     pub tls: TlsFileConfig,
     /// Seconds to retain disconnected resumable tunnels. Zero disables resumption.
-    #[serde(default)]
+    #[serde(default, rename = "reconnect_window", alias = "reconnect_window_secs")]
     pub reconnect_window_secs: u32,
+    /// Reconnect windows in seconds, keyed by an exact configured route pattern.
+    #[serde(default)]
+    pub reconnect_windows: HashMap<String, u32>,
 }
 
 impl ServerFileConfig {
@@ -81,6 +84,14 @@ impl ServerFileConfig {
 
     /// Validate the configuration
     fn validate(&self) -> Result<()> {
+        for pattern in self.reconnect_windows.keys() {
+            if !self.routes.contains_key(pattern) {
+                return Err(Error::config(format!(
+                    "reconnect_windows references unknown route '{}'",
+                    pattern
+                )));
+            }
+        }
         // Validate listen address
         resolve_addr(&self.listen).map_err(|e| {
             Error::config(format!("invalid listen address '{}': {}", self.listen, e))
@@ -130,6 +141,7 @@ pub struct ResolvedConfig {
     pub default_target: Option<String>,
     pub router: Router,
     pub reconnect_window_secs: u32,
+    pub reconnect_windows: HashMap<String, u32>,
 }
 
 impl ResolvedConfig {
@@ -137,6 +149,7 @@ impl ResolvedConfig {
     /// Only the listen address is resolved immediately; route targets are
     /// stored as strings and resolved when connections are established.
     pub fn from_file_config(config: &ServerFileConfig) -> Result<Self> {
+        config.validate()?;
         let listen_addr = resolve_addr(&config.listen)
             .map_err(|e| Error::config(format!("invalid listen address: {}", e)))?;
 
@@ -150,7 +163,21 @@ impl ResolvedConfig {
             default_target: config.default_target.clone(),
             router,
             reconnect_window_secs: config.reconnect_window_secs,
+            reconnect_windows: config.reconnect_windows.clone(),
         })
+    }
+
+    pub(crate) fn resolve(&self, path: &str) -> (Option<String>, u32) {
+        match self.router.resolve_with_pattern(path) {
+            Some((pattern, target)) => (
+                Some(target),
+                self.reconnect_windows
+                    .get(pattern)
+                    .copied()
+                    .unwrap_or(self.reconnect_window_secs),
+            ),
+            None => (self.default_target.clone(), self.reconnect_window_secs),
+        }
     }
 }
 
@@ -273,6 +300,89 @@ impl ConfigWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_windows_follow_matched_patterns_and_global_fallback() -> Result<()> {
+        let config = ServerFileConfig::parse(
+            r#"
+            listen = "127.0.0.1:8080"
+            default_target = "localhost:22"
+            reconnect_window = 600
+            [routes]
+            "/ssh/{host}" = "{host}:22"
+            "/ssh/fixed" = "fixed:22"
+            "/files/{*path}" = "files:80"
+            "/raw" = "localhost:80"
+            [reconnect_windows]
+            "/ssh/{host}" = 1200
+            "/files/{*path}" = 30
+            "/raw" = 0
+            "#,
+        )?;
+        let resolved = ResolvedConfig::from_file_config(&config)?;
+        assert_eq!(
+            resolved.resolve("/ssh/example/"),
+            (Some("example:22".into()), 1200)
+        );
+        assert_eq!(
+            resolved.resolve("/ssh/fixed"),
+            (Some("fixed:22".into()), 600)
+        );
+        assert_eq!(resolved.resolve("/files/a/b").1, 30);
+        assert_eq!(resolved.resolve("/raw").1, 0);
+        assert_eq!(
+            resolved.resolve("/unmatched"),
+            (Some("localhost:22".into()), 600)
+        );
+        let mut changed = config.clone();
+        changed.reconnect_windows.insert("/raw".into(), 10);
+        assert!(config.only_routing_changed(&changed));
+        let existing = resolved;
+        assert_eq!(
+            ResolvedConfig::from_file_config(&changed)?
+                .resolve("/raw")
+                .1,
+            10
+        );
+        assert_eq!(existing.resolve("/raw").1, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn reconnect_window_aliases_and_invalid_overrides() -> Result<()> {
+        let base = "listen = '127.0.0.1:8080'\ndefault_target = 'localhost:22'\n";
+        for key in ["reconnect_window", "reconnect_window_secs"] {
+            assert_eq!(
+                ServerFileConfig::parse(&format!("{base}{key} = 600"))?.reconnect_window_secs,
+                600
+            );
+        }
+        assert!(
+            ServerFileConfig::parse(&format!(
+                "{base}reconnect_window = 10\nreconnect_window_secs = 20"
+            ))
+            .is_err()
+        );
+        assert!(
+            ServerFileConfig::parse(&format!("{base}[reconnect_windows]\n'/missing' = 30"))
+                .is_err()
+        );
+        for value in ["-1", "1.5", "4294967296", "'unlimited'"] {
+            assert!(
+                ServerFileConfig::parse(&format!(
+                    "{base}[routes]\n'/ssh' = 'localhost:22'\n[reconnect_windows]\n'/ssh' = {value}"
+                ))
+                .is_err()
+            );
+        }
+        let enabled = ServerFileConfig::parse(&format!(
+            "{base}[routes]\n'/ssh' = 'localhost:22'\n[reconnect_windows]\n'/ssh' = 60"
+        ))?;
+        let resolved = ResolvedConfig::from_file_config(&enabled)?;
+        assert_eq!(resolved.resolve("/ssh").1, 60);
+        assert_eq!(resolved.resolve("/other").1, 0);
+        Ok(())
+    }
 
     #[test]
     fn reconnect_window_is_optional_validated_and_hot_reloadable() -> Result<()> {
