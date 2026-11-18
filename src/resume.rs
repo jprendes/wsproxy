@@ -590,10 +590,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tokio::net::TcpListener;
     use tokio::task::JoinSet;
     use tokio_tungstenite::tungstenite::protocol::Role;
+
+    use super::*;
 
     async fn pair() -> (Socket, Socket) {
         let (client, server) = tokio::io::duplex(CHUNK * 4);

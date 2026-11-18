@@ -54,9 +54,10 @@ impl Router {
         // Try without trailing slash
         let normalized = path.trim_end_matches('/');
         if normalized != path
-            && let Ok(matched) = self.inner.at(normalized) {
-                return Some(substitute_params(matched.value, matched.params));
-            }
+            && let Ok(matched) = self.inner.at(normalized)
+        {
+            return Some(substitute_params(matched.value, matched.params));
+        }
 
         None
     }
